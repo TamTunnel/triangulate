@@ -1,0 +1,9 @@
+node_modules/
+dist/
+# Gate files never ship.
+ASSESSMENT.md
+REVIEW.md
+JUDGE.md
+# Local run state.
+.triangulate/
+verdict-*.json
