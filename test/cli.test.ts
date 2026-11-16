@@ -12,6 +12,11 @@ import { main } from "../src/cli.js";
 const TEST_HOME = await mkdtemp(join(tmpdir(), "tri-cli-home-"));
 process.env["TRIANGULATE_HOME"] = TEST_HOME;
 
+// The signing key is passphrase-encrypted at rest (§9): tests run
+// non-interactively, so the CI escape hatch supplies the passphrase
+// (the loud stderr warning is expected here).
+process.env["TRIANGULATE_KEY_PASSPHRASE"] = "tri-test-passphrase";
+
 async function fixtureRepo(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "tri-cli-"));
   const git = (...args: string[]): void => {

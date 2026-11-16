@@ -70,6 +70,8 @@ Notes:
   - Claude, Codex and Gemini run their native CLIs; Grok is an API adapter
     (labelled as such in every verdict). No LLM judges anything: the merge
     is deterministic rules plus the repo's own test command.
+  - Test-pick and the final test check run candidate code unsandboxed as
+    your user (see the README's honest limits); use --no-test to skip.
   - A verdict is a signed, content-addressed record — agreement is
     evidence, not proof of correctness. See the README's honest limits.
 `;

@@ -502,3 +502,79 @@ test("arbitrator: a timed-out test run leaves no orphaned grandchildren (B4)", a
   await assert.rejects(readFile(marker, "utf8"), /ENOENT/);
   await rm(markerDir, { recursive: true, force: true });
 });
+
+function captureConsoleError(): { lines: string[]; restore: () => void } {
+  const lines: string[] = [];
+  const orig = console.error;
+  console.error = (...args: unknown[]) => {
+    lines.push(args.map((a) => String(a)).join(" "));
+  };
+  return { lines, restore: () => { console.error = orig; } };
+}
+
+test("arbitrator: the disclosure line appears when test-pick and the final check run (§9)", async () => {
+  const repo = await fixtureRepo({
+    "value.txt": "1\n",
+    "test.sh": "#!/bin/sh\ngrep -q '^3$' value.txt\n",
+  });
+  const { outcomes: outs, baseFiles } = await outcomes(repo, [
+    new FakeAdapter("fake-a", { files: { "value.txt": "2\n" } }),
+    new FakeAdapter("fake-b", { files: { "value.txt": "3\n" } }),
+  ]);
+  const captured = captureConsoleError();
+  try {
+    const { verdict } = await arbitrate({
+      repo,
+      task: "do it",
+      redactTask: false,
+      baseFiles,
+      outcomes: outs,
+      testCommand: "sh test.sh",
+      testTimeoutMs: 5000,
+      keypair,
+      version: "0.1.0",
+    });
+    assert.equal(verdict.tier, "MAJORITY");
+    const disclosures = captured.lines.filter((l) =>
+      l.includes("running candidate code unsandboxed"),
+    );
+    // Once for the test-pick phase, once for the final check.
+    assert.equal(disclosures.length, 2);
+    for (const line of disclosures) {
+      assert.match(line, /use --no-test to skip/);
+      assert.match(line, /as \S+/);
+    }
+  } finally {
+    captured.restore();
+  }
+});
+
+test("arbitrator: testCommand null runs no candidate code and discloses nothing (§9, --no-test)", async () => {
+  const repo = await fixtureRepo({ "a.txt": "l1\nl2\n" });
+  const { outcomes: outs, baseFiles } = await outcomes(repo, [
+    new FakeAdapter("fake-a", { files: { "a.txt": "A\nl2\n" } }),
+    new FakeAdapter("fake-b", { files: { "a.txt": "B\nl2\n" } }),
+  ]);
+  const captured = captureConsoleError();
+  try {
+    const { verdict } = await arbitrate({
+      repo,
+      task: "do it",
+      redactTask: false,
+      baseFiles,
+      outcomes: outs,
+      testCommand: null,
+      testTimeoutMs: 5000,
+      keypair,
+      version: "0.1.0",
+    });
+    assert.equal(verdict.tier, "DIVERGED");
+    assert.equal(verdict.tests, null);
+    assert.equal(
+      captured.lines.some((l) => l.includes("running candidate code unsandboxed")),
+      false,
+    );
+  } finally {
+    captured.restore();
+  }
+});

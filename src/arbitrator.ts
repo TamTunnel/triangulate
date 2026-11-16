@@ -12,7 +12,7 @@
 
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { runCommand } from "./adapters/spawn.js";
@@ -39,6 +39,31 @@ const execFileAsync = promisify(execFile);
 
 /** Test-pick is only attempted when the conflict count is this small (bounds test runs). */
 export const MAX_TEST_PICK_CONFLICTS = 3;
+
+/**
+ * Runtime disclosure (assessment §9, decision (c)/(d)). Test-pick and
+ * the final check execute candidate code as the operator, unsandboxed
+ * — the scrubbed environment and scratch HOME stop naive `$HOME`
+ * reads, but a determined same-uid process resolves the real home
+ * from the passwd DB on any OS and reads the parent environ via
+ * /proc on Linux. This line fires once per phase that actually runs
+ * candidate code (test-pick, then the final check), at the moment of
+ * risk — disclosure, not a prompt. The signing key is the one
+ * exception: key.pem is passphrase-encrypted at rest, so a stolen
+ * copy is ciphertext.
+ */
+export function discloseCandidateExecution(): void {
+  let username = "unknown";
+  try {
+    username = userInfo().username;
+  } catch {
+    username = process.env["USER"] ?? process.env["USERNAME"] ?? "unknown";
+  }
+  console.error(
+    `triangulate: running candidate code unsandboxed as ${username} ` +
+      "(test-pick / final check); use --no-test to skip",
+  );
+}
 
 /**
  * Environment for test runs (B2, B5): test-pick and the final test check
@@ -323,6 +348,7 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
   // Test-pick: only when the rules left a small number of conflicts and
   // a test command exists. Each side is tested in isolation on the base.
   if (merge.conflicts.length > 0 && merge.conflicts.length <= MAX_TEST_PICK_CONFLICTS && testCommand !== null) {
+    discloseCandidateExecution();
     const choices = new Map<string, string>();
     const candidateFiles = new Map(okOutcomes.map((o) => [o.adapter.id, o.files]));
     for (const conflict of merge.conflicts) {
@@ -381,6 +407,7 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
   // The FAILED path returned earlier, so tier is one of the merge tiers here.
   let tests: TestRecord | null = null;
   if (testCommand !== null) {
+    discloseCandidateExecution();
     const first = await runTestsInWorktree(
       opts.repo,
       merge.merged,

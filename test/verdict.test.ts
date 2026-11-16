@@ -12,6 +12,11 @@ import {
 } from "../src/core/verdict.js";
 import type { Verdict, VerdictPayload } from "../src/core/verdict.js";
 import { getOrCreateKeypair } from "../src/core/keys.js";
+
+// The signing key is passphrase-encrypted at rest (§9): tests run
+// non-interactively, so the CI escape hatch supplies the passphrase
+// (the loud stderr warning is expected here).
+process.env["TRIANGULATE_KEY_PASSPHRASE"] = "tri-test-passphrase";
 import {
   appendLog,
   readLog,

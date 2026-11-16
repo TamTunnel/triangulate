@@ -29,7 +29,14 @@ git("add", ".");
 git("commit", "-m", "init");
 
 const tri = new URL("../dist/cli.js", import.meta.url).pathname;
-const env = { ...process.env, TRIANGULATE_HOME: home };
+// The signing key is passphrase-encrypted at rest (§9): the smoke
+// run is non-interactive, so the CI escape hatch supplies the
+// passphrase (the loud stderr warning is expected here).
+const env = {
+  ...process.env,
+  TRIANGULATE_HOME: home,
+  TRIANGULATE_KEY_PASSPHRASE: "tri-smoke-passphrase",
+};
 const run = (args) =>
   spawnSync("node", [tri, ...args], { encoding: "utf8", env });
 
