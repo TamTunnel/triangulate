@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Triangulate — the jury that leaves a signed receipt</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 820px; margin: 0 auto; padding: 2rem 1.25rem; line-height: 1.6; color: #1a1a1a; }
+  h1 { font-size: 2rem; margin-bottom: 0.25rem; }
+  h2 { margin-top: 2rem; }
+  .tagline { font-size: 1.15rem; color: #444; }
+  video { width: 100%; border: 1px solid #ccc; border-radius: 8px; }
+  code { background: #f0f0f0; padding: 0.1em 0.35em; border-radius: 4px; }
+  pre { background: #f4f4f4; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: .85em; }
+  pre code { background: none; padding: 0; }
+  details pre { max-height: 480px; overflow: auto; }
+  .note { background: #fff8e1; border-left: 4px solid #e6a200; padding: 0.75rem 1rem; margin: 1rem 0; }
+  .limits { background: #f7f7f7; border-left: 4px solid #888; padding: 0.75rem 1rem; margin: 1rem 0; }
+  .step { background: #f8f9fa; border-left: 4px solid #2a7ae2; padding: 1rem 1.2rem; margin: 1.2rem 0; border-radius: 0 6px 6px 0; }
+  ol li, ul li { margin-bottom: 0.35rem; }
+  a { color: #0b5fff; }
+  .small { color: #555; font-size: .9em; }
+</style>
+</head>
+<body>
+<h1>Triangulate</h1>
+<p class="tagline">The jury that leaves a signed receipt. Give the same coding task to Claude, Codex, Gemini, and Grok at once, then diff what they produced, arbitrate deterministically, and merge the best output — with a signed, content-addressed verdict that records every disagreement.</p>
+
+<p><a href="https://github.com/TamTunnel/triangulate">Repository on GitHub</a> · Apache-2.0 · TypeScript / Node 24+ · single-package CLI</p>
+
+<h2 id="video">Demo video</h2>
+<p>A real run of the Triangulate CLI — the actual binary, a real git fixture repo, real signing with a throwaway key — from task to verified verdict:</p>
+<video controls preload="metadata" src="triangulate-explainer.mp4">
+  Your browser does not support the video tag. <a href="triangulate-explainer.mp4">Download the video</a>.
+</video>
+<div class="note"><strong>About the video:</strong> the four jurors in this run are <code>--fake</code> scripted adapters — no model credentials exist in the demo environment, so no live model was called. The run, the merge, the signing, and the verification are the real CLI. See the honest limits below.</div>
+
+<h2>1. The run</h2>
+<div class="step">
+<p>One task, four jurors, each in its own git worktree off <code>HEAD</code>. The command as typed:</p>
+<pre><code>$ tri run --task "add a subtract function next to add" --repo ./demo --models claude,codex,gemini,grok --fake --out verdict.json</code></pre>
+<p>Verbatim output:</p>
+<pre><code>triangulate: running 4 juror(s) on /tmp/tri-demo2/demo
+  fake-claude: ok (cost 100 minor, 1 ms)
+  fake-codex: ok (cost 100 minor, 1 ms)
+  fake-gemini: ok (cost 100 minor, 1 ms)
+  fake-grok: ok (cost 100 minor, 1 ms)
+tier: MAJORITY
+verdict: 15713795d03562c2c44453043b13952d8de0b301b72b1d0b32e827206797ed28
+written to /tmp/tri-demo2/verdict.json
+To apply the merged result to your working tree, review the diff with `tri diff` first.</code></pre>
+<p>And the two lines the CLI prints to stderr on every run that executes candidate code:</p>
+<pre><code>triangulate: WARNING: signing-key passphrase supplied via TRIANGULATE_KEY_PASSPHRASE — on Linux a same-user process can read a parent&#x27;s environment via /proc, so this downgrades the key encryption to nothing during test-pick
+triangulate: running candidate code unsandboxed as root (test-pick / final check); use --no-test to skip</code></pre>
+</div>
+
+<h2>2. Verify it offline</h2>
+<div class="step">
+<p>No server, no registry — the signature and the content hash are in the file:</p>
+<pre><code>$ tri verify verdict.json
+VALID  tier=MAJORITY id=15713795d03562c2c44453043b13952d8de0b301b72b1d0b32e827206797ed28</code></pre>
+<p>What the verdict says, in plain terms:</p>
+<pre><code>$ tri show verdict.json
+triangulate verdict 15713795d03562c2c44453043b13952d8de0b301b72b1d0b32e827206797ed28
+  format: triangulate/1  tier: MAJORITY  created: 2026-11-16T02:21:30.825Z
+  task: add a subtract function next to add
+  repo: /tmp/tri-demo2/demo (base HEAD)
+  jurors:
+    fake-claude (cli, fake-claude-1.0): ok, cost 100 minor, 1 ms
+    fake-codex (cli, fake-codex-1.0): ok, cost 100 minor, 1 ms
+    fake-gemini (cli, fake-gemini-1.0): ok, cost 100 minor, 1 ms
+    fake-grok (cli, fake-grok-1.0): ok, cost 100 minor, 1 ms
+  merge: 0 conflict(s), 0 dropped hunk(s)
+  tests: pass (command: node --test, exit 0, flaky: false)</code></pre>
+</div>
+
+<h2>3. The merge</h2>
+<div class="step">
+<p>Deterministic rules plus the repo's own tests — no model grades another model. The merged diff from this run:</p>
+<pre><code>$ tri diff verdict.json
+--- a/notes/claude.md
++++ b/notes/claude.md
+@@ -1,0 +1,4 @@
++# claude
++
++Task: add a subtract function next to add
++
+--- a/notes/codex.md
++++ b/notes/codex.md
+@@ -1,0 +1,4 @@
++# codex
++
++Task: add a subtract function next to add
++
+--- a/notes/gemini.md
++++ b/notes/gemini.md
+@@ -1,0 +1,4 @@
++# gemini
++
++Task: add a subtract function next to add
++
+--- a/notes/grok.md
++++ b/notes/grok.md
+@@ -1,0 +1,4 @@
++# grok
++
++Task: add a subtract function next to add
++</code></pre>
+<p>The full verdict file (<code>triangulate/1</code>, verbatim — the signature is the long JWS at the bottom):</p>
+<details>
+<summary>Full verdict.json</summary>
+<pre><code>{
+  &quot;format&quot;: &quot;triangulate/1&quot;,
+  &quot;created_at&quot;: &quot;2026-11-16T02:21:30.825Z&quot;,
+  &quot;tool&quot;: {
+    &quot;name&quot;: &quot;triangulate&quot;,
+    &quot;version&quot;: &quot;0.1.0&quot;
+  },
+  &quot;task&quot;: {
+    &quot;text&quot;: &quot;add a subtract function next to add&quot;,
+    &quot;hash&quot;: &quot;923657c7277138349241b10219643fafdf049943b5eb1a45227f726764eafb80&quot;
+  },
+  &quot;repo&quot;: {
+    &quot;path&quot;: &quot;/tmp/tri-demo2/demo&quot;,
+    &quot;base&quot;: &quot;HEAD&quot;
+  },
+  &quot;jurors&quot;: [
+    {
+      &quot;id&quot;: &quot;fake-claude&quot;,
+      &quot;model&quot;: &quot;fake-claude-1.0&quot;,
+      &quot;adapter&quot;: &quot;cli&quot;,
+      &quot;status&quot;: &quot;ok&quot;,
+      &quot;costMinor&quot;: 100,
+      &quot;durationMs&quot;: 1,
+      &quot;candidateHash&quot;: &quot;e1177139689836b9294a571c85b6dc60ede51d025901406ab79c7555c8e8d47b&quot;
+    },
+    {
+      &quot;id&quot;: &quot;fake-codex&quot;,
+      &quot;model&quot;: &quot;fake-codex-1.0&quot;,
+      &quot;adapter&quot;: &quot;cli&quot;,
+      &quot;status&quot;: &quot;ok&quot;,
+      &quot;costMinor&quot;: 100,
+      &quot;durationMs&quot;: 1,
+      &quot;candidateHash&quot;: &quot;2efac93d78f6caaa071f6f5de1b0fa7f35e9f89ee7df5d9f6c80effa6b57d7ea&quot;
+    },
+    {
+      &quot;id&quot;: &quot;fake-gemini&quot;,
+      &quot;model&quot;: &quot;fake-gemini-1.0&quot;,
+      &quot;adapter&quot;: &quot;cli&quot;,
+      &quot;status&quot;: &quot;ok&quot;,
+      &quot;costMinor&quot;: 100,
+      &quot;durationMs&quot;: 1,
+      &quot;candidateHash&quot;: &quot;a0bdccb3616e4ed91763ce4aae48c88ea9615fe532d8d9906764f6d724743227&quot;
+    },
+    {
+      &quot;id&quot;: &quot;fake-grok&quot;,
+      &quot;model&quot;: &quot;fake-grok-1.0&quot;,
+      &quot;adapter&quot;: &quot;cli&quot;,
+      &quot;status&quot;: &quot;ok&quot;,
+      &quot;costMinor&quot;: 100,
+      &quot;durationMs&quot;: 1,
+      &quot;candidateHash&quot;: &quot;2a819b4a7d4c96ecef7c6c95f3b7725b75e60c543142f30a4fdacc50d9ea4295&quot;
+    }
+  ],
+  &quot;candidates&quot;: [
+    {
+      &quot;juror&quot;: &quot;fake-claude&quot;,
+      &quot;diff&quot;: &quot;--- a/notes/claude.md\n+++ b/notes/claude.md\n@@ -1,0 +1,4 @@\n+# claude\n+\n+Task: add a subtract function next to add\n+\n&quot;,
+      &quot;hash&quot;: &quot;e1177139689836b9294a571c85b6dc60ede51d025901406ab79c7555c8e8d47b&quot;
+    },
+    {
+      &quot;juror&quot;: &quot;fake-codex&quot;,
+      &quot;diff&quot;: &quot;--- a/notes/codex.md\n+++ b/notes/codex.md\n@@ -1,0 +1,4 @@\n+# codex\n+\n+Task: add a subtract function next to add\n+\n&quot;,
+      &quot;hash&quot;: &quot;2efac93d78f6caaa071f6f5de1b0fa7f35e9f89ee7df5d9f6c80effa6b57d7ea&quot;
+    },
+    {
+      &quot;juror&quot;: &quot;fake-gemini&quot;,
+      &quot;diff&quot;: &quot;--- a/notes/gemini.md\n+++ b/notes/gemini.md\n@@ -1,0 +1,4 @@\n+# gemini\n+\n+Task: add a subtract function next to add\n+\n&quot;,
+      &quot;hash&quot;: &quot;a0bdccb3616e4ed91763ce4aae48c88ea9615fe532d8d9906764f6d724743227&quot;
+    },
+    {
+      &quot;juror&quot;: &quot;fake-grok&quot;,
+      &quot;diff&quot;: &quot;--- a/notes/grok.md\n+++ b/notes/grok.md\n@@ -1,0 +1,4 @@\n+# grok\n+\n+Task: add a subtract function next to add\n+\n&quot;,
+      &quot;hash&quot;: &quot;2a819b4a7d4c96ecef7c6c95f3b7725b75e60c543142f30a4fdacc50d9ea4295&quot;
+    }
+  ],
+  &quot;merge&quot;: {
+    &quot;diff&quot;: &quot;--- a/notes/claude.md\n+++ b/notes/claude.md\n@@ -1,0 +1,4 @@\n+# claude\n+\n+Task: add a subtract function next to add\n+\n--- a/notes/codex.md\n+++ b/notes/codex.md\n@@ -1,0 +1,4 @@\n+# codex\n+\n+Task: add a subtract function next to add\n+\n--- a/notes/gemini.md\n+++ b/notes/gemini.md\n@@ -1,0 +1,4 @@\n+# gemini\n+\n+Task: add a subtract function next to add\n+\n--- a/notes/grok.md\n+++ b/notes/grok.md\n@@ -1,0 +1,4 @@\n+# grok\n+\n+Task: add a subtract function next to add\n+\n&quot;,
+    &quot;conflicts&quot;: [],
+    &quot;dropped&quot;: []
+  },
+  &quot;tests&quot;: {
+    &quot;command&quot;: &quot;node --test&quot;,
+    &quot;exitCode&quot;: 0,
+    &quot;outputHash&quot;: &quot;0a1dde01e1e5f043d0b82d0c58e08e50cbb6a7e33edcebe2c50bae1fcfc24144&quot;,
+    &quot;flaky&quot;: false,
+    &quot;outcome&quot;: &quot;pass&quot;
+  },
+  &quot;tier&quot;: &quot;MAJORITY&quot;,
+  &quot;dissent&quot;: [],
+  &quot;signer&quot;: {
+    &quot;publicKey&quot;: {
+      &quot;kty&quot;: &quot;OKP&quot;,
+      &quot;crv&quot;: &quot;Ed25519&quot;,
+      &quot;x&quot;: &quot;KOj5YxAhdlaXiWDwiWrR_fa8x008reL0mwqkbz4cNIw&quot;
+    },
+    &quot;kid&quot;: &quot;SxEG_9kSxSXX9gYttL5468cNCjGoMdxsrFOGJPFb_co&quot;
+  },
+  &quot;id&quot;: &quot;15713795d03562c2c44453043b13952d8de0b301b72b1d0b32e827206797ed28&quot;,
+  &quot;signature&quot;: &quot;eyJhbGciOiJFZDI1NTE5Iiwia2lkIjoiU3hFR185a1N4U1hYOWdZdHRMNTQ2OGNOQ2pHb01keHNyRk9HSlBGYl9jbyIsInR5cCI6InRyaWFuZ3VsYXRlLXZlcmRpY3QifQ.eyJjYW5kaWRhdGVzIjpbeyJkaWZmIjoiLS0tIGEvbm90ZXMvY2xhdWRlLm1kXG4rKysgYi9ub3Rlcy9jbGF1ZGUubWRcbkBAIC0xLDAgKzEsNCBAQFxuKyMgY2xhdWRlXG4rXG4rVGFzazogYWRkIGEgc3VidHJhY3QgZnVuY3Rpb24gbmV4dCB0byBhZGRcbitcbiIsImhhc2giOiJlMTE3NzEzOTY4OTgzNmI5Mjk0YTU3MWM4NWI2ZGM2MGVkZTUxZDAyNTkwMTQwNmFiNzljNzU1NWM4ZThkNDdiIiwianVyb3IiOiJmYWtlLWNsYXVkZSJ9LHsiZGlmZiI6Ii0tLSBhL25vdGVzL2NvZGV4Lm1kXG4rKysgYi9ub3Rlcy9jb2RleC5tZFxuQEAgLTEsMCArMSw0IEBAXG4rIyBjb2RleFxuK1xuK1Rhc2s6IGFkZCBhIHN1YnRyYWN0IGZ1bmN0aW9uIG5leHQgdG8gYWRkXG4rXG4iLCJoYXNoIjoiMmVmYWM5M2Q3OGY2Y2FhYTA3MWY2ZjVkZTFiMGZhN2YzNWU5Zjg5ZWU3ZGY1ZDlmNmM4MGVmZmE2YjU3ZDdlYSIsImp1cm9yIjoiZmFrZS1jb2RleCJ9LHsiZGlmZiI6Ii0tLSBhL25vdGVzL2dlbWluaS5tZFxuKysrIGIvbm90ZXMvZ2VtaW5pLm1kXG5AQCAtMSwwICsxLDQgQEBcbisjIGdlbWluaVxuK1xuK1Rhc2s6IGFkZCBhIHN1YnRyYWN0IGZ1bmN0aW9uIG5leHQgdG8gYWRkXG4rXG4iLCJoYXNoIjoiYTBiZGNjYjM2MTZlNGVkOTE3NjNjZTRhYWU0OGM4OGVhOTYxNWZlNTMyZDhkOTkwNjc2NGY2ZDcyNDc0MzIyNyIsImp1cm9yIjoiZmFrZS1nZW1pbmkifSx7ImRpZmYiOiItLS0gYS9ub3Rlcy9ncm9rLm1kXG4rKysgYi9ub3Rlcy9ncm9rLm1kXG5AQCAtMSwwICsxLDQgQEBcbisjIGdyb2tcbitcbitUYXNrOiBhZGQgYSBzdWJ0cmFjdCBmdW5jdGlvbiBuZXh0IHRvIGFkZFxuK1xuIiwiaGFzaCI6IjJhODE5YjRhN2Q0Yzk2ZWNlZjdjNmM5NWYzYjc3MjViNzVlNjBjNTQzMTQyZjMwYTRmZGFjYzUwZDllYTQyOTUiLCJqdXJvciI6ImZha2UtZ3JvayJ9XSwiY3JlYXRlZF9hdCI6IjIwMjYtMTEtMTZUMDI6MjE6MzAuODI1WiIsImRpc3NlbnQiOltdLCJmb3JtYXQiOiJ0cmlhbmd1bGF0ZS8xIiwianVyb3JzIjpbeyJhZGFwdGVyIjoiY2xpIiwiY2FuZGlkYXRlSGFzaCI6ImUxMTc3MTM5Njg5ODM2YjkyOTRhNTcxYzg1YjZkYzYwZWRlNTFkMDI1OTAxNDA2YWI3OWM3NTU1YzhlOGQ0N2IiLCJjb3N0TWlub3IiOjEwMCwiZHVyYXRpb25NcyI6MSwiaWQiOiJmYWtlLWNsYXVkZSIsIm1vZGVsIjoiZmFrZS1jbGF1ZGUtMS4wIiwic3RhdHVzIjoib2sifSx7ImFkYXB0ZXIiOiJjbGkiLCJjYW5kaWRhdGVIYXNoIjoiMmVmYWM5M2Q3OGY2Y2FhYTA3MWY2ZjVkZTFiMGZhN2YzNWU5Zjg5ZWU3ZGY1ZDlmNmM4MGVmZmE2YjU3ZDdlYSIsImNvc3RNaW5vciI6MTAwLCJkdXJhdGlvbk1zIjoxLCJpZCI6ImZha2UtY29kZXgiLCJtb2RlbCI6ImZha2UtY29kZXgtMS4wIiwic3RhdHVzIjoib2sifSx7ImFkYXB0ZXIiOiJjbGkiLCJjYW5kaWRhdGVIYXNoIjoiYTBiZGNjYjM2MTZlNGVkOTE3NjNjZTRhYWU0OGM4OGVhOTYxNWZlNTMyZDhkOTkwNjc2NGY2ZDcyNDc0MzIyNyIsImNvc3RNaW5vciI6MTAwLCJkdXJhdGlvbk1zIjoxLCJpZCI6ImZha2UtZ2VtaW5pIiwibW9kZWwiOiJmYWtlLWdlbWluaS0xLjAiLCJzdGF0dXMiOiJvayJ9LHsiYWRhcHRlciI6ImNsaSIsImNhbmRpZGF0ZUhhc2giOiIyYTgxOWI0YTdkNGM5NmVjZWY3YzZjOTVmM2I3NzI1Yjc1ZTYwYzU0MzE0MmYzMGE0ZmRhY2M1MGQ5ZWE0Mjk1IiwiY29zdE1pbm9yIjoxMDAsImR1cmF0aW9uTXMiOjEsImlkIjoiZmFrZS1ncm9rIiwibW9kZWwiOiJmYWtlLWdyb2stMS4wIiwic3RhdHVzIjoib2sifV0sIm1lcmdlIjp7ImNvbmZsaWN0cyI6W10sImRpZmYiOiItLS0gYS9ub3Rlcy9jbGF1ZGUubWRcbisrKyBiL25vdGVzL2NsYXVkZS5tZFxuQEAgLTEsMCArMSw0IEBAXG4rIyBjbGF1ZGVcbitcbitUYXNrOiBhZGQgYSBzdWJ0cmFjdCBmdW5jdGlvbiBuZXh0IHRvIGFkZFxuK1xuLS0tIGEvbm90ZXMvY29kZXgubWRcbisrKyBiL25vdGVzL2NvZGV4Lm1kXG5AQCAtMSwwICsxLDQgQEBcbisjIGNvZGV4XG4rXG4rVGFzazogYWRkIGEgc3VidHJhY3QgZnVuY3Rpb24gbmV4dCB0byBhZGRcbitcbi0tLSBhL25vdGVzL2dlbWluaS5tZFxuKysrIGIvbm90ZXMvZ2VtaW5pLm1kXG5AQCAtMSwwICsxLDQgQEBcbisjIGdlbWluaVxuK1xuK1Rhc2s6IGFkZCBhIHN1YnRyYWN0IGZ1bmN0aW9uIG5leHQgdG8gYWRkXG4rXG4tLS0gYS9ub3Rlcy9ncm9rLm1kXG4rKysgYi9ub3Rlcy9ncm9rLm1kXG5AQCAtMSwwICsxLDQgQEBcbisjIGdyb2tcbitcbitUYXNrOiBhZGQgYSBzdWJ0cmFjdCBmdW5jdGlvbiBuZXh0IHRvIGFkZFxuK1xuIiwiZHJvcHBlZCI6W119LCJyZXBvIjp7ImJhc2UiOiJIRUFEIiwicGF0aCI6Ii90bXAvdHJpLWRlbW8yL2RlbW8ifSwic2lnbmVyIjp7ImtpZCI6IlN4RUdfOWtTeFNYWDlnWXR0TDU0NjhjTkNqR29NZHhzckZPR0pQRmJfY28iLCJwdWJsaWNLZXkiOnsiY3J2IjoiRWQyNTUxOSIsImt0eSI6Ik9LUCIsIngiOiJLT2o1WXhBaGRsYVhpV0R3aVdyUl9mYTh4MDA4cmVMMG13cWtiejRjTkl3In19LCJ0YXNrIjp7Imhhc2giOiI5MjM2NTdjNzI3NzEzODM0OTI0MWIxMDIxOTY0M2ZhZmRmMDQ5OTQzYjVlYjFhNDUyMjdmNzI2NzY0ZWFmYjgwIiwidGV4dCI6ImFkZCBhIHN1YnRyYWN0IGZ1bmN0aW9uIG5leHQgdG8gYWRkIn0sInRlc3RzIjp7ImNvbW1hbmQiOiJub2RlIC0tdGVzdCIsImV4aXRDb2RlIjowLCJmbGFreSI6ZmFsc2UsIm91dGNvbWUiOiJwYXNzIiwib3V0cHV0SGFzaCI6IjBhMWRkZTAxZTFlNWYwNDNkMGI4MmQwYzU4ZTA4ZTUwY2JiNmE3ZTMzZWRjZWJlMmM1MGJhZTFmY2ZjMjQxNDQifSwidGllciI6Ik1BSk9SSVRZIiwidG9vbCI6eyJuYW1lIjoidHJpYW5ndWxhdGUiLCJ2ZXJzaW9uIjoiMC4xLjAifX0.VTfpGiJobLL9TJVyx9mZLVoMRHJRYYmyfVYFPmkO-Rt1OdjwWWWqNgcbbIrWCrxblHouSumwGEqj45hUcVVgDw&quot;
+}</code></pre>
+</details>
+</div>
+
+<h2>What makes it different</h2>
+<ul>
+  <li><strong>Signed, content-addressed verdicts.</strong> Every verdict is an Ed25519 JWS over a canonically-serialized payload; its id is the SHA-256 of that payload. <code>tri verify</code> recomputes both offline. A tampered verdict fails; a verdict with fields deleted fails too.</li>
+  <li><strong>Deterministic merge, not an LLM's opinion.</strong> Line-level 3-way merge with AST-aware refinement, then the repo's own tests settle what the rules can't. Conflicts are recorded with both sides — never silently resolved.</li>
+  <li><strong>The verdict is the product.</strong> <code>triangulate/1</code> is a versioned, machine-readable format other tools can consume; the first consumer is Vouchard scorecards, which can cite a verdict id.</li>
+  <li><strong>Cost is a feature, never a claim.</strong> Per-juror cost is reported only when the tool reports it, never invented; per-juror and global budgets are enforced.</li>
+</ul>
+
+<h2>Honest limits — stated, not hidden</h2>
+<div class="limits">
+<ul>
+  <li><strong>This demo used <code>--fake</code> scripted jurors.</strong> No live model was called and no real-model run has been demonstrated from this environment (no model credentials here). A live run needs the model CLIs and keys on a machine that has them; the Claude/Gemini invocations are best-effort against their documented flags, Codex's flags were verified against the installed binary.</li>
+  <li><strong>A verdict is a record, not a proof of correctness.</strong> Agreement is evidence, not truth. Models that share training data are not independent jurors.</li>
+  <li><strong>Test-pick runs candidate code unsandboxed, as you.</strong> The test environment is scrubbed (PATH and locale basics only, HOME and TMPDIR pointed at scratch directories, test command pinned to the base repo's definition) — but a determined same-user process can resolve your real home from the passwd database on any OS and read a parent's environment via <code>/proc</code> on Linux. The signing key is the one exception: <code>key.pem</code> is passphrase-encrypted at rest (scrypt + AES-256-GCM), so a stolen copy is ciphertext. Everything else under your home is reachable by candidate code. If that is not acceptable for a task or a repo, use <code>--no-test</code>.</li>
+  <li><strong>Model CLIs run unsandboxed too.</strong> A prompt-injected CLI runs with your real <code>HOME</code> (it needs its own auth config there) and could read your files — including the signing key file, which is ciphertext without the passphrase.</li>
+  <li><strong>No revocation in v1.</strong> If your key is lost or replaced, verdicts signed by the old key can no longer be re-signed, and a new key starts a new identity.</li>
+  <li><strong>Cost budgets are enforced at completion for CLI adapters</strong> (they cannot observe cost mid-run); only the fake adapter enforces mid-run. The run itself is bounded by timeout.</li>
+</ul>
+</div>
+
+<h2>Run it yourself</h2>
+<pre><code>npm install -g @tamtunnel/triangulate
+# or: npx @tamtunnel/triangulate
+
+# One task, four jurors, in a git repository:
+tri run --task "Add a subtract function next to add" --repo ./my-project
+
+# See what happened:
+tri show triangulate-verdict.json
+tri diff triangulate-verdict.json
+
+# Verify the verdict offline (no network, no registry):
+tri verify triangulate-verdict.json
+
+# No credentials? Try the pipeline for $0:
+tri run --task "Add a note" --repo ./my-project --fake --no-test</code></pre>
+<p class="small">Requirements: Node 24+, a git repository (the base is <code>HEAD</code>), and the model CLIs you want to use — Claude Code (<code>claude</code>), the OpenAI Codex CLI (<code>codex</code>), the Gemini CLI (<code>gemini</code>) — plus <code>XAI_API_KEY</code> for Grok, which ships as an API adapter (there is no mature Grok coding CLI). Each juror gets only its own key; keys never appear in a verdict, a log, or an error message.</p>
+
+<p class="small">Source: <a href="https://github.com/TamTunnel/triangulate">github.com/TamTunnel/triangulate</a> · Apache-2.0 · Sample verdict generated with the Triangulate CLI, November 2026.</p>
+</body>
+</html>
