@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { arbitrate } from "../src/arbitrator.js";
@@ -348,6 +348,72 @@ test("arbitrator: test runs cannot read API keys from the environment (B2a)", as
   // The test file ran (marker exists) but the secret never reached it.
   assert.equal(await readFile(marker, "utf8"), "missing");
   await rm(markerDir, { recursive: true, force: true });
+});
+
+test("arbitrator: test runs get a scratch HOME — no signing key or ssh key reachable (B5)", async () => {
+  // A fake operator home holding a "signing key" and an ssh key the
+  // candidate must never reach. The test env is built from
+  // process.env at arbitrate time, so point HOME at the fake home.
+  const fakeHome = await mkdtemp(join(tmpdir(), "tri-b5-home-"));
+  await mkdir(join(fakeHome, ".triangulate"), { recursive: true });
+  await writeFile(join(fakeHome, ".triangulate", "key.pem"), "STOLEN-KEY-MARKER", "utf8");
+  await mkdir(join(fakeHome, ".ssh"), { recursive: true });
+  await writeFile(join(fakeHome, ".ssh", "id_ed25519"), "STOLEN-SSH-MARKER", "utf8");
+  const markerDir = await mkdtemp(join(tmpdir(), "tri-b5-"));
+  const marker = join(markerDir, "marker.txt");
+  const repo = await fixtureRepo({
+    "a.js": "export const a = 1;\n",
+    "package.json": JSON.stringify({ scripts: { test: "node --test" } }),
+  });
+  const evil = new FakeAdapter("fake-evil", {
+    files: {
+      "evil.test.mjs":
+        "import fs from 'node:fs';\n" +
+        "import path from 'node:path';\n" +
+        "import os from 'node:os';\n" +
+        "const keyPath = path.join(process.env.HOME, '.triangulate', 'key.pem');\n" +
+        "const sshPath = path.join(os.homedir(), '.ssh', 'id_ed25519');\n" +
+        "const key = fs.existsSync(keyPath) ? fs.readFileSync(keyPath, 'utf8') : 'missing-key';\n" +
+        "const ssh = fs.existsSync(sshPath) ? fs.readFileSync(sshPath, 'utf8') : 'missing-ssh';\n" +
+        `fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ home: process.env.HOME, homedir: os.homedir(), key, ssh }));\n` +
+        "import test from 'node:test';\ntest('evil', () => {});\n",
+    },
+  });
+  const savedHome = process.env["HOME"];
+  process.env["HOME"] = fakeHome;
+  try {
+    const { outcomes: outs, baseFiles } = await outcomes(repo, [evil]);
+    await arbitrate({
+      repo,
+      task: "probe",
+      redactTask: false,
+      baseFiles,
+      outcomes: outs,
+      testCommand: "node --test",
+      testTimeoutMs: 10_000,
+      keypair,
+      version: "0.1.0",
+    });
+  } finally {
+    if (savedHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = savedHome;
+  }
+  // The test file ran (marker exists) but found neither key, and the
+  // HOME it saw — via env and via os.homedir() — is the scratch home,
+  // not the operator's.
+  const seen = JSON.parse(await readFile(marker, "utf8")) as {
+    home: string;
+    homedir: string;
+    key: string;
+    ssh: string;
+  };
+  assert.equal(seen.key, "missing-key");
+  assert.equal(seen.ssh, "missing-ssh");
+  assert.notEqual(seen.home, fakeHome);
+  assert.notEqual(seen.homedir, fakeHome);
+  assert.equal(seen.home, seen.homedir);
+  await rm(markerDir, { recursive: true, force: true });
+  await rm(fakeHome, { recursive: true, force: true });
 });
 
 test("arbitrator: 'npm test' runs the base repo's test script, never a candidate's rewrite (B2b)", async () => {

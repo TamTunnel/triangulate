@@ -257,6 +257,35 @@ test("orchestrator: global budget stops launching once cumulative cost exceeds i
   assert.equal(byId.get("fake-c")?.files.size, 0);
 });
 
+test("orchestrator: global budget at exactly the cap launches no further juror (N1)", async () => {
+  const repo = await fixtureRepo();
+  const result = await orchestrate({
+    repo,
+    task: "probe",
+    jurors: [
+      new FakeAdapter("fake-a", { files: { "a.txt": "A\nl2\nl3\n" }, costMinor: 100 }),
+      new FakeAdapter("fake-b", { files: { "b.txt": "B\nY\n" }, costMinor: 100 }),
+      new FakeAdapter("fake-c", { files: { "c.txt": "C\n" }, costMinor: 100 }),
+    ],
+    timeoutMs: 10_000,
+    budgetMinor: 0,
+    globalBudgetMinor: 100,
+    env: {},
+  });
+  const byId = new Map(result.outcomes.map((o) => [o.adapter.id, o]));
+  assert.equal(byId.get("fake-a")?.result.status, "ok");
+  // After the first juror the cumulative cost (100) is exactly the cap:
+  // the budget is spent, so the second juror must not launch — with
+  // `>` instead of `>=` it would run and total reported spend would
+  // reach 200 against a 100 cap.
+  assert.equal(byId.get("fake-b")?.result.status, "budget");
+  assert.equal(byId.get("fake-c")?.result.status, "budget");
+  const spent = result.outcomes
+    .filter((o) => o.result.status === "ok")
+    .reduce((sum, o) => sum + (o.result.costMinor ?? 0), 0);
+  assert.equal(spent, 100);
+});
+
 test("orchestrator: global budget large enough to cover all jurors runs them all (F9)", async () => {
   const repo = await fixtureRepo();
   const result = await orchestrate({

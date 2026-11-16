@@ -273,6 +273,12 @@ export function isValidVerdictShape(payload: unknown): boolean {
     }
   }
   if (!isTier(payload["tier"])) return false;
+  // A verdict with no jurors and a non-FAILED tier is semantically
+  // empty (N10): UNANIMOUS/MAJORITY/DIVERGED over zero jurors means
+  // nothing, so it is malformed rather than valid. FAILED is the
+  // exception: a run in which every juror failed still records its
+  // (possibly empty) outcome list, and that verdict must verify.
+  if (payload["tier"] !== "FAILED" && jurors.length === 0) return false;
   if (!Array.isArray(payload["dissent"])) return false;
   for (const d of payload["dissent"] as unknown[]) {
     if (!isRecord(d)) return false;

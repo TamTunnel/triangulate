@@ -41,15 +41,29 @@ const execFileAsync = promisify(execFile);
 export const MAX_TEST_PICK_CONFLICTS = 3;
 
 /**
- * Environment for test runs (B2): test-pick and the final test check
+ * Environment for test runs (B2, B5): test-pick and the final test check
  * execute candidate code, so they run with a scrubbed environment —
- * PATH/HOME/TMPDIR and locale/shell basics only, NO credentials.
- * `scopedEnv(env, [])` passes exactly those and nothing else: no
- * ANTHROPIC_API_KEY, XAI_API_KEY, or any other key-shaped variable
+ * PATH and locale/shell basics only, NO credentials, and NO operator
+ * home. `scopedEnv(env, [])` passes exactly those and nothing else:
+ * no ANTHROPIC_API_KEY, XAI_API_KEY, or any other key-shaped variable
  * from the operator's environment ever reaches candidate code.
+ *
+ * HOME/TMPDIR are the subtle part (B5): the signing key lives at
+ * `$HOME/.triangulate/key.pem`, so passing the operator's real HOME
+ * through would hand candidate code the trust anchor for the whole
+ * verdict format — plus ~/.ssh, ~/.aws, and every other credential
+ * under the home directory. The caller therefore supplies a scratch
+ * home inside the disposable test-worktree root: `process.env.HOME`
+ * and `os.homedir()` both resolve there (Node's homedir checks $HOME
+ * first — merely *deleting* HOME would fall back to the passwd entry
+ * and hand the real home back). TMPDIR points at a scratch dir too,
+ * so temp files land inside the disposable root.
  */
-export function scrubbedTestEnv(): NodeJS.ProcessEnv {
-  return scopedEnv(process.env, []);
+export function scrubbedTestEnv(scratchHome: string, scratchTmp: string): NodeJS.ProcessEnv {
+  return scopedEnv(
+    { ...process.env, HOME: scratchHome, TMPDIR: scratchTmp },
+    [],
+  );
 }
 
 /**
@@ -143,11 +157,18 @@ async function runTestsInWorktree(
       }
     }
     // B2: scrubbed environment — no credentials reach candidate code.
-    // B4: runCommand spawns detached and kills the whole process group
-    // on timeout, so a hung test's grandchildren cannot outlive the run.
+    // B5: HOME/TMPDIR point at scratch dirs inside this disposable
+    // root, never at the operator's real home (the signing key lives
+    // there). B4: runCommand spawns detached and kills the whole
+    // process group on timeout, so a hung test's grandchildren cannot
+    // outlive the run.
+    const scratchHome = join(root, "home");
+    const scratchTmp = join(root, "tmp");
+    await mkdir(scratchHome, { recursive: true });
+    await mkdir(scratchTmp, { recursive: true });
     const result = await runCommand("sh", ["-c", command], {
       cwd: worktree,
-      env: scrubbedTestEnv(),
+      env: scrubbedTestEnv(scratchHome, scratchTmp),
       timeoutMs,
     });
     const output = `${result.stdout}\n${result.stderr}`;

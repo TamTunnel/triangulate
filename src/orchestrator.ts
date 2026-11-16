@@ -286,13 +286,17 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
     if (globalBudget > 0) {
       // Global budget (A-2): jurors launch one at a time so the
       // cumulative reported cost is known before the next launch.
-      // Once it exceeds the cap, the remaining jurors are recorded as
+      // Once it reaches the cap, the remaining jurors are recorded as
       // `budget` (never run) and the verdict records the partial
       // state. Costs the tools do not report (null) cannot be counted.
       const outcomes: JurorOutcome[] = [];
       let cumulative = 0;
       for (const adapter of opts.jurors) {
-        if (cumulative > globalBudget) {
+        // N1: `>=`, not `>`. At exactly the cap the budget is spent:
+        // launching one more juror would exceed it. The cap is soft
+        // anyway (CLI costs are known only at completion), so this
+        // only removes a one-juror overshoot at the boundary.
+        if (cumulative >= globalBudget) {
           outcomes.push({
             adapter,
             result: {
@@ -302,7 +306,7 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
               modelVersion: "unknown",
               stdout: "",
               stderr: "",
-              reason: `not run: global budget ${globalBudget} minor exceeded (cumulative reported cost ${cumulative} minor)`,
+              reason: `not run: global budget ${globalBudget} minor reached (cumulative reported cost ${cumulative} minor)`,
             },
             files: new Map(),
             diff: "",

@@ -190,6 +190,27 @@ test("keys: concurrent first runs generate one keypair, not two (N4)", async () 
   assert.equal(pub.x, kp.publicKey.x);
 });
 
+test("verdict: a correctly signed verdict with zero jurors and a non-FAILED tier is INVALID (N10)", () => {
+  const kp = generateKeypair();
+  // UNANIMOUS over zero jurors is semantically empty, even when the
+  // signature is valid — the signature proves who signed these bytes,
+  // not that the bytes form a verdict.
+  const emptyUnanimous = samplePayload(kp);
+  emptyUnanimous.jurors = [];
+  emptyUnanimous.candidates = [];
+  emptyUnanimous.tier = "UNANIMOUS";
+  const result = verifyVerdict(signVerdict(emptyUnanimous, kp));
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "malformed-verdict");
+  // FAILED is the exception: a run in which every juror failed may
+  // legitimately record an empty outcome list.
+  const emptyFailed = samplePayload(kp);
+  emptyFailed.jurors = [];
+  emptyFailed.candidates = [];
+  emptyFailed.tier = "FAILED";
+  assert.equal(verifyVerdict(signVerdict(emptyFailed, kp)).ok, true);
+});
+
 test("verdict: non-string or missing signature is INVALID, never a throw (B3)", () => {
   const kp = generateKeypair();
   const verdict = signVerdict(samplePayload(kp), kp);
