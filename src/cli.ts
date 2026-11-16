@@ -56,7 +56,7 @@ Options for run:
   --budget <minor>      per-juror cost budget in minor units (0 = no cap)
   --global-budget <minor>  cap on total spend across jurors (0 = no cap);
                         when set, jurors launch one at a time and launching
-                        stops once the cumulative reported cost exceeds it;
+                        stops once the cumulative reported cost reaches it;
                         costs the tools do not report cannot be counted
   --test-cmd <cmd>      test command for arbitration (default: auto-detect 'npm test')
   --no-test             skip the test check entirely

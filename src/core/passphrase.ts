@@ -12,6 +12,7 @@
 import { spawnSync } from "node:child_process";
 import { closeSync, createReadStream, openSync } from "node:fs";
 import { createInterface } from "node:readline";
+import type { Readable } from "node:stream";
 
 export class PassphraseError extends Error {}
 
@@ -23,6 +24,52 @@ function stty(fd: number, arg: "-echo" | "echo"): void {
         "set TRIANGULATE_KEY_PASSPHRASE to provide the signing-key passphrase",
     );
   }
+}
+
+/**
+ * Read one line from a stream. Rejects cleanly on EOF (N13) instead
+ * of hanging: readline emits `close` when the input ends without a
+ * line, and a promise that only listens for `line`/`error` never
+ * settles. Exported for tests (an empty Readable is EOF at once).
+ */
+export async function readLineOrThrow(stream: Readable): Promise<string> {
+  return new Promise<string>((resolvePromise, rejectPromise) => {
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+    let settled = false;
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    rl.once("line", (value) => {
+      settle(() => {
+        rl.close();
+        resolvePromise(value);
+      });
+    });
+    rl.once("close", () => {
+      settle(() =>
+        rejectPromise(
+          new PassphraseError(
+            "passphrase entry aborted (end of input); " +
+              "run interactively or set TRIANGULATE_KEY_PASSPHRASE",
+          ),
+        ),
+      );
+    });
+    rl.once("error", (error) => {
+      settle(() => {
+        rl.close();
+        rejectPromise(error);
+      });
+    });
+    stream.once("error", (error) => {
+      settle(() => {
+        rl.close();
+        rejectPromise(error);
+      });
+    });
+  });
 }
 
 /**
@@ -49,21 +96,7 @@ export async function promptPassphrase(promptText: string): Promise<Buffer> {
     stty(fd, "-echo");
     process.stderr.write(promptText);
     const stream = createReadStream("", { fd, autoClose: false });
-    const line = await new Promise<string>((resolvePromise, rejectPromise) => {
-      const rl = createInterface({ input: stream, crlfDelay: Infinity });
-      rl.once("line", (value) => {
-        rl.close();
-        resolvePromise(value);
-      });
-      rl.once("error", (error) => {
-        rl.close();
-        rejectPromise(error);
-      });
-      stream.once("error", (error) => {
-        rl.close();
-        rejectPromise(error);
-      });
-    });
+    const line = await readLineOrThrow(stream);
     return Buffer.from(line, "utf8");
   } finally {
     try {

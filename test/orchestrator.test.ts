@@ -232,7 +232,7 @@ test("orchestrator: a capture failure records the juror as failed, not a run cra
   assert.equal(byId.get("fake-ok")?.result.status, "ok");
 });
 
-test("orchestrator: global budget stops launching once cumulative cost exceeds it (F9, A-2)", async () => {
+test("orchestrator: global budget stops launching once cumulative cost reaches it (F9, A-2)", async () => {
   const repo = await fixtureRepo();
   const result = await orchestrate({
     repo,

@@ -28,7 +28,7 @@ import { join } from "node:path";
 import { generateKeypair, keypairFromPem } from "./jws.js";
 import type { Keypair } from "./jws.js";
 import { decryptPrivateKey, encryptPrivateKey, isEncryptedKeyFile } from "./keyfile.js";
-import { promptPassphrase as promptPassphraseOnTty } from "./passphrase.js";
+import { PassphraseError, promptPassphrase as promptPassphraseOnTty } from "./passphrase.js";
 import { withFileLock } from "./lock.js";
 
 export function defaultKeyDir(): string {
@@ -38,6 +38,19 @@ export function defaultKeyDir(): string {
 const PRIVATE_NAME = "key.pem";
 const PUBLIC_NAME = "key.pub.json";
 const PASSPHRASE_ENV = "TRIANGULATE_KEY_PASSPHRASE";
+
+/**
+ * Minimum passphrase length (B7): a key "encrypted" under an empty or
+ * trivially short passphrase is effectively plaintext — the salt is in
+ * the envelope, so offline brute force at scrypt N=16384 falls in
+ * milliseconds. Enforced once here, in resolvePassphrase, so the TTY
+ * prompt, the env-var hatch, and the migration path are all covered.
+ * Consequence, by design: a key created before this check with a
+ * short passphrase can no longer be loaded — fail closed, not fail
+ * open. Its owner deletes key.pem and creates a new key (a new
+ * identity, as with any lost key — see the README).
+ */
+const MIN_PASSPHRASE_LENGTH = 8;
 
 export interface GetKeypairOptions {
   /** Override the passphrase prompt (tests). When unset, the TTY prompt is used. */
@@ -68,9 +81,19 @@ async function resolvePassphrase(
   prompt?: (text: string) => Promise<Buffer>,
 ): Promise<Buffer> {
   const fromEnv = envPassphrase();
-  if (fromEnv !== null) return fromEnv;
-  if (prompt !== undefined) return prompt(promptText);
-  return promptPassphraseOnTty(promptText);
+  const passphrase =
+    fromEnv !== null
+      ? fromEnv
+      : prompt !== undefined
+        ? await prompt(promptText)
+        : await promptPassphraseOnTty(promptText);
+  if (passphrase.toString("utf8").length < MIN_PASSPHRASE_LENGTH) {
+    passphrase.fill(0);
+    throw new PassphraseError(
+      `signing-key passphrase must be at least ${MIN_PASSPHRASE_LENGTH} characters`,
+    );
+  }
+  return passphrase;
 }
 
 /**

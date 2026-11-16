@@ -233,3 +233,55 @@ test(
     assert.equal(line, "FOUND");
   },
 );
+
+test("keyfile: empty and short passphrases are rejected at key creation (B7)", async () => {
+  // A key "encrypted" under "" or "x" is effectively plaintext — the
+  // salt is in the envelope, so offline brute force falls in
+  // milliseconds. Creation must fail cleanly and leave no key file.
+  for (const bad of ["", "x", "1234567"]) {
+    const dir = await mkdtemp(join(tmpdir(), "tri-keyshort-"));
+    await assert.rejects(
+      getOrCreateKeypair(dir, { promptPassphrase: prompt(bad) }),
+      /at least 8 characters/,
+    );
+    await assert.rejects(readFile(join(dir, "key.pem"), "utf8"));
+  }
+});
+
+test("keyfile: an 8-character passphrase is accepted and the key loads again (B7)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tri-key8-"));
+  const kp = await getOrCreateKeypair(dir, { promptPassphrase: prompt("12345678") });
+  assert.equal(isEncryptedKeyFile(await readFile(join(dir, "key.pem"), "utf8")), true);
+  const kp2 = await getOrCreateKeypair(dir, { promptPassphrase: prompt("12345678") });
+  assert.equal(kp2.kid, kp.kid);
+});
+
+test("keyfile: a short TRIANGULATE_KEY_PASSPHRASE is rejected cleanly (B7)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tri-keyenvshort-"));
+  const previous = process.env["TRIANGULATE_KEY_PASSPHRASE"];
+  process.env["TRIANGULATE_KEY_PASSPHRASE"] = "short";
+  const origError = console.error;
+  console.error = () => {};
+  try {
+    await assert.rejects(getOrCreateKeypair(dir), /at least 8 characters/);
+    await assert.rejects(readFile(join(dir, "key.pem"), "utf8"));
+  } finally {
+    console.error = origError;
+    if (previous === undefined) delete process.env["TRIANGULATE_KEY_PASSPHRASE"];
+    else process.env["TRIANGULATE_KEY_PASSPHRASE"] = previous;
+  }
+});
+
+test("keyfile: migration with a short passphrase is rejected and the plaintext key is untouched (B7)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tri-keymigshort-"));
+  const original = generateKeypair();
+  await writeFile(join(dir, "key.pem"), original.privateKeyPem, { mode: 0o600 });
+  await assert.rejects(
+    getOrCreateKeypair(dir, { promptPassphrase: prompt("x") }),
+    /at least 8 characters/,
+  );
+  // Nothing was re-encrypted: the plaintext key is exactly as found.
+  const stored = await readFile(join(dir, "key.pem"), "utf8");
+  assert.equal(stored, original.privateKeyPem);
+  assert.equal(isEncryptedKeyFile(stored), false);
+});

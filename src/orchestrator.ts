@@ -53,7 +53,7 @@ export interface OrchestratorOptions {
   budgetMinor: number;
   /** Global cost budget across all jurors in minor units (0 = no cap).
    * When set, jurors launch sequentially and launching stops once the
-   * cumulative reported cost exceeds it (A-2); costs the tools do not
+   * cumulative reported cost reaches it (A-2); costs the tools do not
    * report (null) cannot be counted toward the cap. */
   globalBudgetMinor?: number;
   env: NodeJS.ProcessEnv;
