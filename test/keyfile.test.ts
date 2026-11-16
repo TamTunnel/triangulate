@@ -285,3 +285,23 @@ test("keyfile: migration with a short passphrase is rejected and the plaintext k
   assert.equal(stored, original.privateKeyPem);
   assert.equal(isEncryptedKeyFile(stored), false);
 });
+
+test("keyfile: a pre-existing short-passphrase key fails closed on load and states the remedy (N18)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tri-keyshortold-"));
+  // A key encrypted directly with a 1-char passphrase (round-4
+  // semantics, before the B7 floor existed) — written straight to
+  // disk, bypassing resolvePassphrase.
+  const original = generateKeypair();
+  const short = Buffer.from("x", "utf8");
+  await writeFile(join(dir, "key.pem"), encryptPrivateKey(original.privateKeyPem, short), {
+    mode: 0o600,
+  });
+  const before = await readFile(join(dir, "key.pem"), "utf8");
+  await assert.rejects(
+    getOrCreateKeypair(dir, { promptPassphrase: prompt("x") }),
+    /at least 8 characters.*delete key\.pem to start a new identity/s,
+  );
+  // Fail closed: no signing happened, and the file is byte-identical.
+  const after = await readFile(join(dir, "key.pem"), "utf8");
+  assert.equal(after, before);
+});

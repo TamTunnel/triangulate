@@ -169,10 +169,22 @@ export async function getOrCreateKeypair(
       }
     }
     if (isEncryptedKeyFile(stored)) {
-      const passphrase = await resolvePassphrase(
-        "triangulate: signing-key passphrase: ",
-        opts.promptPassphrase,
-      );
+      let passphrase: Buffer;
+      try {
+        passphrase = await resolvePassphrase(
+          "triangulate: signing-key passphrase: ",
+          opts.promptPassphrase,
+        );
+      } catch (error) {
+        // N18: a pre-existing key protected by a now-too-short passphrase
+        // fails closed on load — say what the operator must do about it.
+        if (error instanceof PassphraseError) {
+          throw new PassphraseError(
+            `${error.message} — a key protected by a shorter passphrase can no longer be loaded; delete ${PRIVATE_NAME} to start a new identity`,
+          );
+        }
+        throw error;
+      }
       try {
         const keypair = keypairFromPem(decryptPrivateKey(stored, passphrase));
         await checkOrWritePublic(pubPath, keypair);
