@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { arbitrate } from "../src/arbitrator.js";
@@ -311,4 +311,128 @@ test("arbitrator: delete vs keep is recorded as a conflict and the file stays (F
   assert.ok(conflict !== undefined);
   assert.equal(conflict.rule, "unresolved");
   assert.equal(verifyVerdict(verdict).ok, true);
+});
+
+test("arbitrator: test runs cannot read API keys from the environment (B2a)", async () => {
+  const markerDir = await mkdtemp(join(tmpdir(), "tri-b2a-"));
+  const marker = join(markerDir, "marker.txt");
+  const repo = await fixtureRepo({
+    "a.js": "export const a = 1;\n",
+    "package.json": JSON.stringify({ scripts: { test: "node --test" } }),
+  });
+  const evil = new FakeAdapter("fake-evil", {
+    files: {
+      "evil.test.mjs":
+        "import fs from 'node:fs';\n" +
+        `fs.writeFileSync(${JSON.stringify(marker)}, process.env.FAKE_SECRET_KEY ?? 'missing');\n` +
+        "import test from 'node:test';\ntest('evil', () => {});\n",
+    },
+  });
+  process.env["FAKE_SECRET_KEY"] = "SECRET-VALUE-12345";
+  try {
+    const { outcomes: outs, baseFiles } = await outcomes(repo, [evil]);
+    await arbitrate({
+      repo,
+      task: "probe",
+      redactTask: false,
+      baseFiles,
+      outcomes: outs,
+      testCommand: "node --test",
+      testTimeoutMs: 10_000,
+      keypair,
+      version: "0.1.0",
+    });
+  } finally {
+    delete process.env["FAKE_SECRET_KEY"];
+  }
+  // The test file ran (marker exists) but the secret never reached it.
+  assert.equal(await readFile(marker, "utf8"), "missing");
+  await rm(markerDir, { recursive: true, force: true });
+});
+
+test("arbitrator: 'npm test' runs the base repo's test script, never a candidate's rewrite (B2b)", async () => {
+  const markerDir = await mkdtemp(join(tmpdir(), "tri-b2b-"));
+  const marker = join(markerDir, "marker.txt");
+  const repo = await fixtureRepo({
+    "a.js": "export const a = 1;\n",
+    "package.json": JSON.stringify({ scripts: { test: "node --test" } }),
+  });
+  const evil = new FakeAdapter("fake-evil", {
+    files: {
+      "package.json": JSON.stringify({
+        scripts: {
+          test: `node -e "require('node:fs').writeFileSync(${JSON.stringify(marker)},'pwned')"`,
+        },
+      }),
+    },
+  });
+  const { outcomes: outs, baseFiles } = await outcomes(repo, [evil]);
+  const { verdict } = await arbitrate({
+    repo,
+    task: "probe",
+    redactTask: false,
+    baseFiles,
+    outcomes: outs,
+    testCommand: "npm test",
+    testTimeoutMs: 10_000,
+    keypair,
+    version: "0.1.0",
+  });
+  // The verdict trail records what actually ran: the base script.
+  assert.equal(verdict.tests?.command, "node --test");
+  await assert.rejects(readFile(marker, "utf8"), /ENOENT/);
+  await rm(markerDir, { recursive: true, force: true });
+});
+
+test("arbitrator: 'npm test' with no base test script skips tests and records it (B2)", async () => {
+  const repo = await fixtureRepo({ "a.txt": "l1\nl2\n" });
+  const { outcomes: outs, baseFiles } = await outcomes(repo, [
+    new FakeAdapter("fake-a", { files: { "a.txt": "A\nl2\n" } }),
+    new FakeAdapter("fake-b", { files: { "a.txt": "B\nl2\n" } }),
+  ]);
+  const { verdict } = await arbitrate({
+    repo,
+    task: "do it",
+    redactTask: false,
+    baseFiles,
+    outcomes: outs,
+    testCommand: "npm test",
+    testTimeoutMs: 5000,
+    keypair,
+    version: "0.1.0",
+  });
+  assert.equal(verdict.tests, null);
+  assert.equal(verdict.tier, "DIVERGED");
+  assert.ok(verdict.dissent.some((d) => d.kind === "test-command"));
+});
+
+test("arbitrator: a timed-out test run leaves no orphaned grandchildren (B4)", async () => {
+  const markerDir = await mkdtemp(join(tmpdir(), "tri-b4-"));
+  const marker = join(markerDir, "marker.txt");
+  const repo = await fixtureRepo({ "a.js": "export const a = 1;\n" });
+  const { outcomes: outs, baseFiles } = await outcomes(repo, [
+    new FakeAdapter("fake-a", { files: { "b.js": "export const b = 2;\n" } }),
+  ]);
+  const cmd = `(sleep 3; echo done > ${marker}) & wait`;
+  const t0 = Date.now();
+  const { verdict } = await arbitrate({
+    repo,
+    task: "probe",
+    redactTask: false,
+    baseFiles,
+    outcomes: outs,
+    testCommand: cmd,
+    testTimeoutMs: 500,
+    keypair,
+    version: "0.1.0",
+  });
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 3000, `arbitrate took ${elapsed}ms`);
+  assert.equal(verdict.tests?.outcome, "fail");
+  assert.equal(verdict.tests?.command, cmd);
+  // Past the sleeper's 3s deadline: if the grandchild survived the
+  // timeout it would have written the marker by now.
+  await new Promise((r) => setTimeout(r, 4000));
+  await assert.rejects(readFile(marker, "utf8"), /ENOENT/);
+  await rm(markerDir, { recursive: true, force: true });
 });

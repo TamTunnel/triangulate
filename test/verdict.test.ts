@@ -189,3 +189,48 @@ test("keys: concurrent first runs generate one keypair, not two (N4)", async () 
   const kp = await getOrCreateKeypair(dir);
   assert.equal(pub.x, kp.publicKey.x);
 });
+
+test("verdict: non-string or missing signature is INVALID, never a throw (B3)", () => {
+  const kp = generateKeypair();
+  const verdict = signVerdict(samplePayload(kp), kp);
+  for (const bad of [123, undefined, null]) {
+    const v = { ...verdict, signature: bad } as unknown as Verdict;
+    const result = verifyVerdict(v);
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "malformed-verdict");
+  }
+});
+
+test("verdict: signed but structurally malformed payloads are INVALID (B3)", () => {
+  const kp = generateKeypair();
+  const noTask = samplePayload(kp) as unknown as Record<string, unknown>;
+  delete noTask["task"];
+  assert.equal(
+    verifyVerdict(signVerdict(noTask as unknown as VerdictPayload, kp)).ok,
+    false,
+  );
+  const noMerge = samplePayload(kp) as unknown as Record<string, unknown>;
+  delete noMerge["merge"];
+  assert.equal(
+    verifyVerdict(signVerdict(noMerge as unknown as VerdictPayload, kp)).ok,
+    false,
+  );
+  const badJurors = samplePayload(kp) as unknown as Record<string, unknown>;
+  badJurors["jurors"] = "not-an-array";
+  assert.equal(
+    verifyVerdict(signVerdict(badJurors as unknown as VerdictPayload, kp)).ok,
+    false,
+  );
+  const badTier = samplePayload(kp) as unknown as Record<string, unknown>;
+  badTier["tier"] = "MAYBE";
+  assert.equal(
+    verifyVerdict(signVerdict(badTier as unknown as VerdictPayload, kp)).ok,
+    false,
+  );
+  const badTests = samplePayload(kp) as unknown as Record<string, unknown>;
+  badTests["tests"] = { command: "npm test" };
+  assert.equal(
+    verifyVerdict(signVerdict(badTests as unknown as VerdictPayload, kp)).ok,
+    false,
+  );
+});

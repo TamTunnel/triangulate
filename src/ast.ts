@@ -62,16 +62,27 @@ function topLevelNodes(source: string, language: unknown): NamedNode[] | null {
   const tree = parser.parse(source);
   const nodes: NamedNode[] = [];
   // Top-level declarations may be wrapped in `export_statement`
-  // (`export function foo() {}`) — unwrap one level.
-  const declarations: Parser.SyntaxNode[] = [];
+  // (`export function foo() {}`) — the node's span is the WHOLE
+  // statement including the `export` prefix: the inner declaration
+  // starts after `export `, so a byte-range attribution against the
+  // inner span would miss the declaration's first line (B1 fix
+  // regression). The splice replaces the whole statement text, so
+  // base and candidate spans must use the same definition.
   for (const child of tree.rootNode.namedChildren) {
     if (child.type === "export_statement") {
-      declarations.push(...child.namedChildren);
-    } else {
-      declarations.push(child);
+      for (const inner of child.namedChildren) {
+        if (!NAMED_DECL_KINDS.has(inner.type)) continue;
+        const nameNode = inner.childForFieldName("name");
+        if (nameNode === null) continue;
+        nodes.push({
+          key: `${inner.type}:${nameNode.text}`,
+          start: child.startIndex,
+          end: child.endIndex,
+          text: child.text,
+        });
+      }
+      continue;
     }
-  }
-  for (const child of declarations) {
     if (!NAMED_DECL_KINDS.has(child.type)) continue;
     const nameNode = child.childForFieldName("name");
     if (nameNode === null) continue;
@@ -102,27 +113,42 @@ export function tryAstMerge(
   const baseByKey = new Map(baseNodes.map((n) => [n.key, n]));
 
   // Every changed line must lie inside a named base node, or the merge
-  // cannot attribute it. Line starts are byte offsets (tree-sitter
-  // works in UTF-8 bytes); binary-search them per lookup.
+  // cannot attribute it. Attribution is by BYTE range, not by row: two
+  // declarations can share a line (e.g. `} export function b() {...}`),
+  // and a row-based lookup attributes both changes to the first node,
+  // silently dropping the second (B1). A changed line is attributed to
+  // a node only when the line's whole content range lies strictly
+  // inside that node's [start, end) byte range; a line that straddles
+  // a node boundary, or lies outside every node, returns null and the
+  // caller falls back to the line merge (which records the conflict).
+  const buf = Buffer.from(baseContent, "utf8");
   const baseLines = baseContent.split("\n");
   const lineStarts = lineStartOffsets(baseContent);
-  const rowOfOffset = (byteOffset: number): number => {
-    let lo = 0;
-    let hi = lineStarts.length - 1;
-    while (lo < hi) {
-      const mid = Math.floor((lo + hi + 1) / 2);
-      const midStart = lineStarts[mid];
-      if (midStart === undefined) break;
-      if (midStart <= byteOffset) lo = mid;
-      else hi = mid - 1;
+  /** Content byte range [start, end) of a 0-based base line, without its line terminator. */
+  const lineContentRange = (line: number): [number, number] => {
+    const start = lineStarts[line] as number;
+    let end = line + 1 < lineStarts.length ? (lineStarts[line + 1] as number) : buf.length;
+    if (end > start && buf[end - 1] === 0x0a) end -= 1;
+    if (end > start && buf[end - 1] === 0x0d) end -= 1;
+    return [start, end];
+  };
+  const nodeForRange = (start: number, end: number): NamedNode | null => {
+    for (const node of baseNodes) {
+      // The range must start at or after the node start, end at or
+      // before the node end, and start strictly before the node end
+      // (so an empty range at exactly the node end is outside it).
+      if (node.start <= start && end <= node.end && start < node.end) return node;
     }
-    return lo;
+    return null;
   };
   const nodeOfLine = (row: number): NamedNode | null => {
+    const [start, end] = lineContentRange(row);
+    return nodeForRange(start, end);
+  };
+  /** Node containing a byte position (insertion anchor): start-inclusive, end-exclusive. */
+  const nodeAtOffset = (offset: number): NamedNode | null => {
     for (const node of baseNodes) {
-      const startRow = rowOfOffset(node.start);
-      const endRow = rowOfOffset(node.end);
-      if (row >= startRow && row <= endRow) return node;
+      if (node.start <= offset && offset < node.end) return node;
     }
     return null;
   };
@@ -146,10 +172,12 @@ export function tryAstMerge(
         changedKeys.add(node.key);
       }
       // Pure insertions anchor to a base position: attribute to the node
-      // containing the anchor line (or the previous line at EOF).
+      // containing the anchor line's start byte (or the previous line
+      // at EOF). An insertion between nodes attributes to no node and
+      // the merge falls back to the line merge.
       if (hunk.baseStart === hunk.baseEnd) {
         const anchor = Math.max(0, Math.min(hunk.baseStart, baseLines.length - 1));
-        const node = nodeOfLine(anchor);
+        const node = nodeAtOffset(lineStarts[anchor] as number);
         if (node === null) return null;
         changedKeys.add(node.key);
       }
@@ -180,7 +208,6 @@ export function tryAstMerge(
   if (replacements.size === 0) return null;
   // Splice from the end so earlier offsets stay valid. Work on bytes:
   // tree-sitter offsets are UTF-8 byte offsets.
-  const buf = Buffer.from(baseContent, "utf8");
   const ordered = [...replacements.values()].sort((a, b) => b.start - a.start);
   const chunks: Buffer[] = [];
   let cursor = buf.length;

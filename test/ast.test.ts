@@ -120,3 +120,32 @@ export function bar(): number {
   assert.equal(result.conflicts.length, 0);
   assert.match(result.merged.get("src/a.ts") as string, /return 5;/);
 });
+
+test("ast: two declarations sharing one line changed by different jurors are never silently dropped (B1)", () => {
+  const base = "export function a() { return 1; } export function b() { return 2; }\n";
+  const aaa = "export function a() { return 10; } export function b() { return 2; }\n";
+  const zzz = "export function a() { return 1; } export function b() { return 20; }\n";
+  const result = mergeCandidates(map([["same.ts", base]]), [
+    { juror: "aaa", files: map([["same.ts", aaa]]) },
+    { juror: "zzz", files: map([["same.ts", zzz]]) },
+  ]);
+  const merged = result.merged.get("same.ts") as string;
+  // Either both changes survive, or the loss is recorded as a conflict
+  // (the line merge conflicts on the shared line). Never a silent drop.
+  const bothPresent = merged.includes("return 10") && merged.includes("return 20");
+  assert.ok(bothPresent || result.conflicts.length > 0 || result.dropped.length > 0);
+  assert.equal(result.astRefined.length, 0);
+});
+
+test("ast: closing brace sharing a line with the next declaration merges both edits (B1)", () => {
+  const base = "export function a() {\n  return 1;\n} export function b() { return 2; }\n";
+  const aaa = "export function a() {\n  return 10;\n} export function b() { return 2; }\n";
+  const zzz = "export function a() {\n  return 1;\n} export function b() { return 20; }\n";
+  const result = mergeCandidates(map([["f.ts", base]]), [
+    { juror: "aaa", files: map([["f.ts", aaa]]) },
+    { juror: "zzz", files: map([["f.ts", zzz]]) },
+  ]);
+  const merged = result.merged.get("f.ts") as string;
+  assert.match(merged, /return 10/);
+  assert.match(merged, /return 20/);
+});

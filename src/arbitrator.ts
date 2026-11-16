@@ -15,6 +15,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
+import { runCommand } from "./adapters/spawn.js";
+import { scopedEnv } from "./adapters/types.js";
 import { mergeCandidates, renderUnifiedDiff } from "./differ.js";
 import type { ConflictRecord as DifferConflict, FileMap } from "./differ.js";
 import { signVerdict, taskHash } from "./core/verdict.js";
@@ -37,6 +39,52 @@ const execFileAsync = promisify(execFile);
 
 /** Test-pick is only attempted when the conflict count is this small (bounds test runs). */
 export const MAX_TEST_PICK_CONFLICTS = 3;
+
+/**
+ * Environment for test runs (B2): test-pick and the final test check
+ * execute candidate code, so they run with a scrubbed environment —
+ * PATH/HOME/TMPDIR and locale/shell basics only, NO credentials.
+ * `scopedEnv(env, [])` passes exactly those and nothing else: no
+ * ANTHROPIC_API_KEY, XAI_API_KEY, or any other key-shaped variable
+ * from the operator's environment ever reaches candidate code.
+ */
+export function scrubbedTestEnv(): NodeJS.ProcessEnv {
+  return scopedEnv(process.env, []);
+}
+
+/**
+ * Pin the test command to the BASE repo's definition (B2). "npm test"
+ * is resolved by npm from the package.json in the working directory —
+ * and the test worktree holds candidate files, so a candidate that
+ * rewrites package.json's test script would get its own command run.
+ * Resolve "npm test" / "npm run test" to the base repo's
+ * scripts.test string (read from the base file map, i.e. HEAD) and run
+ * that string directly. When the base repo has no test script there
+ * is no test command at all: returns null, and the caller records
+ * that test-pick/final-check were unavailable instead of running
+ * anything. Any other command is the operator's explicit --test-cmd
+ * and is used as given.
+ */
+export function resolveBaseTestCommand(
+  command: string,
+  baseFiles: FileMap,
+): string | null {
+  if (command !== "npm test" && command !== "npm run test") return command;
+  const pkgRaw = baseFiles.get("package.json");
+  if (pkgRaw === undefined) return null;
+  let pkg: unknown;
+  try {
+    pkg = JSON.parse(pkgRaw) as unknown;
+  } catch {
+    return null;
+  }
+  if (typeof pkg !== "object" || pkg === null) return null;
+  const scripts = (pkg as { scripts?: unknown }).scripts;
+  if (typeof scripts !== "object" || scripts === null) return null;
+  const testScript = (scripts as Record<string, unknown>)["test"];
+  if (typeof testScript !== "string" || testScript.length === 0) return null;
+  return testScript;
+}
 
 export interface ArbitrateOptions {
   repo: string;
@@ -94,36 +142,21 @@ async function runTestsInWorktree(
         await rm(join(worktree, name), { force: true });
       }
     }
-    const started = Date.now();
-    let exitCode: number | null = null;
-    let output = "";
-    let timedOut = false;
-    try {
-      const { stdout, stderr } = await execFileAsync("sh", ["-c", command], {
-        cwd: worktree,
-        timeout: timeoutMs,
-        encoding: "utf8",
-        maxBuffer: 16 * 1024 * 1024,
-      });
-      output = `${stdout}\n${stderr}`;
-      exitCode = 0;
-    } catch (error) {
-      const err = error as NodeJS.ErrnoException & {
-        stdout?: string;
-        stderr?: string;
-        code?: number;
-        killed?: boolean;
-      };
-      output = `${err.stdout ?? ""}\n${err.stderr ?? ""}`;
-      if (typeof err.code === "number") exitCode = err.code;
-      timedOut = err.killed === true || (Date.now() - started >= timeoutMs && exitCode === null);
-    }
+    // B2: scrubbed environment — no credentials reach candidate code.
+    // B4: runCommand spawns detached and kills the whole process group
+    // on timeout, so a hung test's grandchildren cannot outlive the run.
+    const result = await runCommand("sh", ["-c", command], {
+      cwd: worktree,
+      env: scrubbedTestEnv(),
+      timeoutMs,
+    });
+    const output = `${result.stdout}\n${result.stderr}`;
     const truncated = truncateOutput(output);
     return {
-      exitCode,
+      exitCode: result.exitCode,
       outputHash: canonicalHash(truncated),
-      passed: exitCode === 0,
-      timedOut,
+      passed: result.exitCode === 0,
+      timedOut: result.timedOut,
     };
   } finally {
     try {
@@ -245,6 +278,16 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
     return { verdict: signVerdict(payload, opts.keypair), mergedFiles: new Map() };
   }
 
+  // B2: pin the test command to the base repo's definition (an "npm
+  // test" that resolves against candidate files would run the
+  // candidate's script). When the base repo has no test script there
+  // is no test check at all — recorded in dissent, not silently skipped.
+  const testCommand =
+    opts.testCommand === null
+      ? null
+      : resolveBaseTestCommand(opts.testCommand, opts.baseFiles);
+  const testCommandUnavailable = opts.testCommand !== null && testCommand === null;
+
   // First pass: deterministic rules only.
   let merge = mergeCandidates(
     opts.baseFiles,
@@ -258,7 +301,7 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
 
   // Test-pick: only when the rules left a small number of conflicts and
   // a test command exists. Each side is tested in isolation on the base.
-  if (merge.conflicts.length > 0 && merge.conflicts.length <= MAX_TEST_PICK_CONFLICTS && opts.testCommand !== null) {
+  if (merge.conflicts.length > 0 && merge.conflicts.length <= MAX_TEST_PICK_CONFLICTS && testCommand !== null) {
     const choices = new Map<string, string>();
     const candidateFiles = new Map(okOutcomes.map((o) => [o.adapter.id, o.files]));
     for (const conflict of merge.conflicts) {
@@ -277,7 +320,7 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
           opts.repo,
           variant,
           opts.baseFiles,
-          opts.testCommand,
+          testCommand,
           opts.testTimeoutMs,
         );
         if (!first.passed) continue;
@@ -286,7 +329,7 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
           opts.repo,
           variant,
           opts.baseFiles,
-          opts.testCommand,
+          testCommand,
           opts.testTimeoutMs,
         );
         if (second.passed) {
@@ -316,12 +359,12 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
   // Final test check on the merged result (recorded, never tier-changing — D-5).
   // The FAILED path returned earlier, so tier is one of the merge tiers here.
   let tests: TestRecord | null = null;
-  if (opts.testCommand !== null) {
+  if (testCommand !== null) {
     const first = await runTestsInWorktree(
       opts.repo,
       merge.merged,
       opts.baseFiles,
-      opts.testCommand,
+      testCommand,
       opts.testTimeoutMs,
     );
     let flaky = false;
@@ -333,7 +376,7 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
         opts.repo,
         merge.merged,
         opts.baseFiles,
-        opts.testCommand,
+        testCommand,
         opts.testTimeoutMs,
       );
       if (second.passed) {
@@ -343,11 +386,20 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
         outputHash = second.outputHash;
       }
     }
-    tests = { command: opts.testCommand, exitCode, outputHash, flaky, outcome };
+    tests = { command: testCommand, exitCode, outputHash, flaky, outcome };
   }
 
   // Dissent: every disagreement that survived into the verdict, as facts.
   const dissent: DissentEntry[] = [];
+  if (testCommandUnavailable) {
+    dissent.push({
+      kind: "test-command",
+      note:
+        `test command ${JSON.stringify(opts.testCommand)} could not be resolved ` +
+        "from the base repo (no test script at HEAD); test-pick and the final " +
+        "test check were skipped rather than running a candidate-defined command",
+    });
+  }
   for (const conflict of merge.conflicts) {
     dissent.push({
       kind: "conflict",

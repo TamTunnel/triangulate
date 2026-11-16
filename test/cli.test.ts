@@ -179,3 +179,27 @@ test("cli: --dry-run creates no signing keypair (N3)", async () => {
     process.env["TRIANGULATE_HOME"] = TEST_HOME;
   }
 });
+
+test("cli: verify/show/diff reject a non-string signature with exit 2, never a crash (B3)", async () => {
+  const repo = await fixtureRepo();
+  const out = join(repo, "verdict.json");
+  await main([
+    "run",
+    "--task",
+    "add a note",
+    "--repo",
+    repo,
+    "--models",
+    "claude",
+    "--fake",
+    "--no-test",
+    "--out",
+    out,
+  ]);
+  const verdict = JSON.parse(await readFile(out, "utf8")) as Record<string, unknown>;
+  verdict["signature"] = 123;
+  await writeFile(out, JSON.stringify(verdict), "utf8");
+  assert.equal(await main(["verify", out]), 2);
+  assert.equal(await main(["show", out]), 2);
+  assert.equal(await main(["diff", out]), 2);
+});

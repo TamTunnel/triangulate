@@ -318,7 +318,14 @@ async function cmdVerify(args: string[]): Promise<number> {
   const [file] = args;
   if (file === undefined || args.length !== 1) fail("usage: tri verify <verdict.json>");
   const verdict = await readVerdictOrFail(file);
-  const result = verifyVerdict(verdict);
+  // Verification must never throw on malformed input (B3): any throw
+  // is INVALID, exit 2 — exactly like loadVerifiedVerdict.
+  let result: VerifyVerdictResult;
+  try {
+    result = verifyVerdict(verdict);
+  } catch {
+    result = { ok: false, reason: "malformed-verdict" };
+  }
   if (result.ok) {
     console.log(`VALID  tier=${verdict.tier} id=${verdict.id}`);
     return 0;

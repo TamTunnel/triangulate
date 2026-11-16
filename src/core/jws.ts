@@ -103,6 +103,9 @@ export interface VerifyJwsResult {
  * signature verifies over header.payload.
  */
 export function verifyJws(jws: string, publicKey: Ed25519Jwk): VerifyJwsResult {
+  // Defense in depth (B3): never throw on malformed input — a
+  // non-string JWS is malformed, not a crash.
+  if (typeof jws !== "string") return { ok: false, reason: "malformed-jws" };
   const parts = jws.split(".");
   if (parts.length !== 3) return { ok: false, reason: "malformed-jws" };
   const [headerB64, payloadB64, sigB64] = parts;
@@ -143,7 +146,12 @@ export function verifyJws(jws: string, publicKey: Ed25519Jwk): VerifyJwsResult {
   }
   const signingInput = `${headerB64}.${payloadB64}`;
   const sig = base64urlDecode(sigB64);
-  const valid = verify(null, Buffer.from(signingInput, "utf8"), keyObject, sig);
+  let valid: boolean;
+  try {
+    valid = verify(null, Buffer.from(signingInput, "utf8"), keyObject, sig);
+  } catch {
+    return { ok: false, reason: "bad-signature" };
+  }
   if (!valid) return { ok: false, reason: "bad-signature" };
   return { ok: true, payload };
 }

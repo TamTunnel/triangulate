@@ -151,6 +151,149 @@ export interface VerifyVerdictResult {
   reason?: string;
 }
 
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every((e) => typeof e === "string");
+}
+
+function isTier(v: unknown): v is VerdictTier {
+  return v === "UNANIMOUS" || v === "MAJORITY" || v === "DIVERGED" || v === "FAILED";
+}
+
+/**
+ * Structural validation of a verdict payload (B3). Verdict files are
+ * untrusted input — shared, downloaded, attached to agent listings —
+ * so a VALID stamp must mean "a well-formed, correctly signed
+ * verdict", not merely "a signature that checks out over whatever
+ * JSON was handed in". A correctly signed document with `task` or
+ * `merge` deleted, or `jurors` replaced by a string, is INVALID, and
+ * must never reach `show`/`diff` (which index into these fields).
+ * Unknown extra fields are allowed: they are part of the payload and
+ * therefore covered by the id recomputation.
+ */
+export function isValidVerdictShape(payload: unknown): boolean {
+  if (!isRecord(payload)) return false;
+  if (payload["format"] !== VERDICT_FORMAT) return false;
+  if (typeof payload["created_at"] !== "string") return false;
+  const tool = payload["tool"];
+  if (!isRecord(tool) || typeof tool["name"] !== "string" || typeof tool["version"] !== "string") {
+    return false;
+  }
+  const task = payload["task"];
+  if (!isRecord(task) || typeof task["hash"] !== "string") return false;
+  if (task["text"] !== undefined && typeof task["text"] !== "string") return false;
+  const repo = payload["repo"];
+  if (!isRecord(repo) || typeof repo["path"] !== "string" || typeof repo["base"] !== "string") {
+    return false;
+  }
+  const jurors = payload["jurors"];
+  if (!Array.isArray(jurors)) return false;
+  for (const j of jurors) {
+    if (!isRecord(j)) return false;
+    if (typeof j["id"] !== "string" || typeof j["model"] !== "string") return false;
+    if (j["adapter"] !== "cli" && j["adapter"] !== "api") return false;
+    if (
+      j["status"] !== "ok" &&
+      j["status"] !== "failed" &&
+      j["status"] !== "timeout" &&
+      j["status"] !== "budget"
+    ) {
+      return false;
+    }
+    if (j["costMinor"] !== null && typeof j["costMinor"] !== "number") return false;
+    if (typeof j["durationMs"] !== "number") return false;
+    if (j["candidateHash"] !== null && typeof j["candidateHash"] !== "string") return false;
+    if (j["reason"] !== undefined && typeof j["reason"] !== "string") return false;
+  }
+  const candidates = payload["candidates"];
+  if (!Array.isArray(candidates)) return false;
+  for (const c of candidates) {
+    if (!isRecord(c)) return false;
+    if (typeof c["juror"] !== "string" || typeof c["diff"] !== "string") return false;
+    if (typeof c["hash"] !== "string") return false;
+    if (c["binaryChanges"] !== undefined && !isStringArray(c["binaryChanges"])) return false;
+    if (c["skippedChanges"] !== undefined && !isStringArray(c["skippedChanges"])) return false;
+  }
+  const merge = payload["merge"];
+  if (!isRecord(merge) || typeof merge["diff"] !== "string") return false;
+  if (!Array.isArray(merge["conflicts"]) || !Array.isArray(merge["dropped"])) return false;
+  for (const c of merge["conflicts"] as unknown[]) {
+    if (!isRecord(c)) return false;
+    if (typeof c["file"] !== "string") return false;
+    const bl = c["baseLines"];
+    if (bl !== null) {
+      if (!isRecord(bl) || typeof bl["start"] !== "number" || typeof bl["end"] !== "number") {
+        return false;
+      }
+    }
+    if (!isRecord(c["sides"])) return false;
+    for (const side of Object.values(c["sides"])) {
+      if (!isStringArray(side)) return false;
+    }
+    if (
+      c["rule"] !== "disjoint" &&
+      c["rule"] !== "ast-disjoint" &&
+      c["rule"] !== "subset" &&
+      c["rule"] !== "tests" &&
+      c["rule"] !== "unresolved"
+    ) {
+      return false;
+    }
+    if (c["winner"] !== undefined && typeof c["winner"] !== "string") return false;
+  }
+  for (const d of merge["dropped"] as unknown[]) {
+    if (!isRecord(d)) return false;
+    if (
+      typeof d["file"] !== "string" ||
+      typeof d["juror"] !== "string" ||
+      typeof d["rule"] !== "string" ||
+      typeof d["detail"] !== "string"
+    ) {
+      return false;
+    }
+  }
+  if (merge["astRefined"] !== undefined && !isStringArray(merge["astRefined"])) return false;
+  const tests = payload["tests"];
+  if (tests !== null) {
+    if (!isRecord(tests)) return false;
+    if (typeof tests["command"] !== "string") return false;
+    if (tests["exitCode"] !== null && typeof tests["exitCode"] !== "number") return false;
+    if (tests["outputHash"] !== null && typeof tests["outputHash"] !== "string") return false;
+    if (typeof tests["flaky"] !== "boolean") return false;
+    if (
+      tests["outcome"] !== "pass" &&
+      tests["outcome"] !== "fail" &&
+      tests["outcome"] !== "flaky" &&
+      tests["outcome"] !== "not-run"
+    ) {
+      return false;
+    }
+  }
+  if (!isTier(payload["tier"])) return false;
+  if (!Array.isArray(payload["dissent"])) return false;
+  for (const d of payload["dissent"] as unknown[]) {
+    if (!isRecord(d)) return false;
+    if (typeof d["kind"] !== "string" || typeof d["note"] !== "string") return false;
+    if (d["juror"] !== undefined && typeof d["juror"] !== "string") return false;
+    if (d["file"] !== undefined && typeof d["file"] !== "string") return false;
+  }
+  const signer = payload["signer"];
+  if (!isRecord(signer) || typeof signer["kid"] !== "string") return false;
+  const pub = signer["publicKey"];
+  if (
+    !isRecord(pub) ||
+    pub["kty"] !== "OKP" ||
+    pub["crv"] !== "Ed25519" ||
+    typeof pub["x"] !== "string"
+  ) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * Offline verification: recompute the id from the canonical payload and
  * verify the JWS against the embedded signer key. Returns the first
@@ -160,8 +303,17 @@ export function verifyVerdict(verdict: Verdict): VerifyVerdictResult {
   if (verdict === null || typeof verdict !== "object" || Array.isArray(verdict)) {
     return { ok: false, reason: "malformed-verdict" };
   }
+  // The signature is split inside verifyJws: a non-string (or missing)
+  // signature must be INVALID, never a thrown TypeError (B3).
+  if (typeof verdict.id !== "string" || typeof verdict.signature !== "string") {
+    return { ok: false, reason: "malformed-verdict" };
+  }
   if (verdict.format !== VERDICT_FORMAT) return { ok: false, reason: "format-mismatch" };
   const { id, signature, ...payload } = verdict as Verdict & Record<string, unknown>;
+  // Shape first: a signature over a structurally malformed payload is
+  // still INVALID — the signature only proves who signed these bytes,
+  // not that the bytes form a verdict.
+  if (!isValidVerdictShape(payload)) return { ok: false, reason: "malformed-verdict" };
   // The payload must contain exactly the signed fields; anything extra
   // in the envelope that is not id/signature is part of the payload and
   // therefore covered by the id recomputation below.
