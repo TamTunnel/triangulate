@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { orchestrate } from "../src/orchestrator.js";
@@ -133,4 +133,143 @@ test("orchestrator: not a git repo throws", async () => {
     }),
     /not a git repository/,
   );
+});
+
+test("orchestrator: symlink in a worktree is never followed, secret stays out (F1, S-4)", async () => {
+  const repo = await fixtureRepo();
+  const secretDir = await mkdtemp(join(tmpdir(), "tri-secret-"));
+  const secretPath = join(secretDir, "secret.txt");
+  await writeFile(secretPath, "TOP-SECRET-VALUE-12345", "utf8");
+  class LinkAdapter implements JurorAdapter {
+    readonly id = "linker";
+    readonly kind = "cli" as const;
+    async run(input: { worktree: string }): Promise<JurorRunResult> {
+      await symlink(secretPath, join(input.worktree, "leak.txt"));
+      return {
+        status: "ok",
+        costMinor: null,
+        durationMs: 1,
+        modelVersion: "probe",
+        stdout: "",
+        stderr: "",
+      };
+    }
+  }
+  const result = await orchestrate({
+    repo,
+    task: "probe",
+    jurors: [new LinkAdapter()],
+    timeoutMs: 10_000,
+    budgetMinor: 0,
+    env: {},
+  });
+  const outcome = result.outcomes[0];
+  assert.ok(outcome !== undefined);
+  assert.equal(outcome.result.status, "ok");
+  assert.equal(outcome.files.has("leak.txt"), false);
+  assert.equal(outcome.diff.includes("TOP-SECRET-VALUE-12345"), false);
+  assert.deepEqual(outcome.skippedChanges, ["leak.txt"]);
+});
+
+test("orchestrator: a 20,001-line added file does not crash the run (F3, S-8)", async () => {
+  const repo = await fixtureRepo();
+  const big = Array.from({ length: 20_001 }, (_, i) => `line ${i}`).join("\n");
+  const result = await orchestrate({
+    repo,
+    task: "probe",
+    jurors: [
+      new FakeAdapter("fake-big", { files: { "big.txt": big } }),
+      new FakeAdapter("fake-small", { files: { "a.txt": "l1\nCHANGED\nl3\n" } }),
+    ],
+    timeoutMs: 10_000,
+    budgetMinor: 0,
+    env: {},
+  });
+  assert.equal(result.outcomes.length, 2);
+  const bigOutcome = result.outcomes.find((o) => o.adapter.id === "fake-big");
+  assert.ok(bigOutcome !== undefined);
+  assert.equal(bigOutcome.result.status, "ok");
+  // The candidate diff is a placeholder, not 20,001 lines of content.
+  assert.match(bigOutcome.diff, /oversize/);
+  assert.equal(bigOutcome.diff.includes("line 20000"), false);
+  const small = result.outcomes.find((o) => o.adapter.id === "fake-small");
+  assert.ok(small !== undefined);
+  assert.equal(small.result.status, "ok");
+});
+
+test("orchestrator: a capture failure records the juror as failed, not a run crash (F3)", async () => {
+  const repo = await fixtureRepo();
+  class CorruptAdapter implements JurorAdapter {
+    readonly id = "corrupt";
+    readonly kind = "cli" as const;
+    async run(input: { worktree: string }): Promise<JurorRunResult> {
+      // Destroy the worktree's .git pointer: `git status` in capture fails.
+      await rm(join(input.worktree, ".git"), { force: true });
+      return {
+        status: "ok",
+        costMinor: null,
+        durationMs: 1,
+        modelVersion: "probe",
+        stdout: "",
+        stderr: "",
+      };
+    }
+  }
+  const result = await orchestrate({
+    repo,
+    task: "probe",
+    jurors: [
+      new CorruptAdapter(),
+      new FakeAdapter("fake-ok", { files: { "a.txt": "l1\nl2\nCHANGED\n" } }),
+    ],
+    timeoutMs: 10_000,
+    budgetMinor: 0,
+    env: {},
+  });
+  const byId = new Map(result.outcomes.map((o) => [o.adapter.id, o]));
+  assert.equal(byId.get("corrupt")?.result.status, "failed");
+  assert.match(byId.get("corrupt")?.result.reason ?? "", /capture failed/);
+  assert.equal(byId.get("fake-ok")?.result.status, "ok");
+});
+
+test("orchestrator: global budget stops launching once cumulative cost exceeds it (F9, A-2)", async () => {
+  const repo = await fixtureRepo();
+  const result = await orchestrate({
+    repo,
+    task: "probe",
+    jurors: [
+      new FakeAdapter("fake-a", { files: { "a.txt": "A\nl2\nl3\n" }, costMinor: 100 }),
+      new FakeAdapter("fake-b", { files: { "b.txt": "B\nY\n" }, costMinor: 100 }),
+      new FakeAdapter("fake-c", { files: { "c.txt": "C\n" }, costMinor: 100 }),
+    ],
+    timeoutMs: 10_000,
+    budgetMinor: 0,
+    globalBudgetMinor: 150,
+    env: {},
+  });
+  const byId = new Map(result.outcomes.map((o) => [o.adapter.id, o]));
+  assert.equal(byId.get("fake-a")?.result.status, "ok");
+  assert.equal(byId.get("fake-b")?.result.status, "ok");
+  // After two jurors the cumulative cost (200) exceeds the cap (150),
+  // so the third juror never launches.
+  assert.equal(byId.get("fake-c")?.result.status, "budget");
+  assert.match(byId.get("fake-c")?.result.reason ?? "", /global budget/);
+  assert.equal(byId.get("fake-c")?.files.size, 0);
+});
+
+test("orchestrator: global budget large enough to cover all jurors runs them all (F9)", async () => {
+  const repo = await fixtureRepo();
+  const result = await orchestrate({
+    repo,
+    task: "probe",
+    jurors: [
+      new FakeAdapter("fake-a", { files: { "a.txt": "A\nl2\nl3\n" }, costMinor: 100 }),
+      new FakeAdapter("fake-b", { files: { "b.txt": "B\nY\n" }, costMinor: 100 }),
+    ],
+    timeoutMs: 10_000,
+    budgetMinor: 0,
+    globalBudgetMinor: 500,
+    env: {},
+  });
+  assert.equal(result.outcomes.every((o) => o.result.status === "ok"), true);
 });

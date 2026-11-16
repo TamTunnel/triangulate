@@ -97,8 +97,10 @@ export interface VerifyJwsResult {
 
 /**
  * Verify a compact JWS against an embedded public key. Checks: well-formed
- * header, alg is Ed25519, kid equals the fingerprint of the given public
- * key, and the signature verifies over header.payload.
+ * header, alg is Ed25519, typ is "triangulate-verdict" (a JWS minted
+ * for another purpose under the same key must not verify here, N5),
+ * kid equals the fingerprint of the given public key, and the
+ * signature verifies over header.payload.
  */
 export function verifyJws(jws: string, publicKey: Ed25519Jwk): VerifyJwsResult {
   const parts = jws.split(".");
@@ -113,7 +115,11 @@ export function verifyJws(jws: string, publicKey: Ed25519Jwk): VerifyJwsResult {
   } catch {
     return { ok: false, reason: "malformed-header" };
   }
-  if (header["alg"] !== "Ed25519" || typeof header["kid"] !== "string") {
+  if (
+    header["alg"] !== "Ed25519" ||
+    header["typ"] !== "triangulate-verdict" ||
+    typeof header["kid"] !== "string"
+  ) {
     return { ok: false, reason: "malformed-header" };
   }
   let expectedKid: string;

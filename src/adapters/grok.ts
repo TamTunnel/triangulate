@@ -5,13 +5,17 @@
 // `adapter: "api"` in every verdict, so a reader never mistakes it for a
 // native-CLI juror. The model is asked for a JSON map of changed files
 // (path -> complete new contents); the map is validated (relative paths
-// only, string values) and the orchestrator then diffs the worktree
+// only, no `.git` segment, string values) and written with
+// writeFileWithin, which never follows a symlink — a model response
+// cannot overwrite the worktree's `.git` pointer or escape the
+// worktree (S-2, S-7). The orchestrator then diffs the worktree
 // with git, exactly as for CLI jurors. Cost is not computed from a price
 // table — the API reports usage, not a dollar figure, so cost is
 // "unknown" unless a future version adds a pinned price table.
 
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { readFile, readdir, stat } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { resolveSafeTarget, writeFileWithin } from "../core/safewrite.js";
 import { redactSecrets, truncateOutput } from "./types.js";
 import type { JurorAdapter, JurorRunInput, JurorRunResult } from "./types.js";
 
@@ -69,6 +73,10 @@ function parseFileMap(content: string): Map<string, string> | null {
   for (const [path, value] of Object.entries(parsed as Record<string, unknown>)) {
     if (typeof value !== "string") return null;
     if (path.length === 0 || path.startsWith("/") || path.includes("..")) return null;
+    // No `.git` segment anywhere: a file map must never touch the
+    // worktree's git pointer or config (S-2, S-7 — a `.git` overwrite
+    // lets a model response execute arbitrary git config hooks).
+    if (path.split("/").some((segment) => segment === ".git")) return null;
     out.set(path, value);
   }
   return out;
@@ -172,10 +180,25 @@ export class GrokAdapter implements JurorAdapter {
         reason: "grok returned output that was not a valid file map",
       };
     }
+    // Validate every target before writing any of them: a rejected
+    // path fails the juror without a partial application.
+    for (const [relativePath] of fileMap) {
+      try {
+        await resolveSafeTarget(input.worktree, relativePath);
+      } catch (error) {
+        return {
+          status: "failed",
+          costMinor: null,
+          durationMs: duration(),
+          modelVersion,
+          stdout: "",
+          stderr: "",
+          reason: `grok file map rejected: ${redactSecrets(error instanceof Error ? error.message : String(error)).slice(0, 200)}`,
+        };
+      }
+    }
     for (const [relativePath, fileContent] of fileMap) {
-      const target = join(input.worktree, relativePath);
-      await mkdir(dirname(target), { recursive: true });
-      await writeFile(target, fileContent, "utf8");
+      await writeFileWithin(input.worktree, relativePath, fileContent);
     }
     return {
       status: "ok",

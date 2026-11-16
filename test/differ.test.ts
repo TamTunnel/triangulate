@@ -2,6 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  DiffTooLargeError,
   diffLines,
   mergeCandidates,
   opsToHunks,
@@ -214,4 +215,120 @@ test("merge: every candidate hunk appears somewhere (D-6)", () => {
   assert.equal(result.merged.get("f.txt"), "A\nB\nC\nd");
   assert.equal(result.conflicts.length, 0);
   assert.equal(result.dropped.length, 0);
+});
+
+test("merge: delete vs keep is recorded and the file stays (F4, D-6)", () => {
+  const base = map([["victim.txt", "keep me\n"]]);
+  const result = mergeCandidates(base, [
+    { juror: "claude", files: map([]) },
+    { juror: "codex", files: map([["victim.txt", "keep me\n"]]) },
+  ]);
+  // Deletion needs agreement: the file stays, and the disagreement is
+  // on the record as an unresolved whole-file conflict.
+  assert.equal(result.merged.get("victim.txt"), "keep me\n");
+  assert.equal(result.conflicts.length, 1);
+  const conflict = result.conflicts[0];
+  assert.ok(conflict !== undefined);
+  assert.equal(conflict.rule, "unresolved");
+  assert.equal(conflict.baseLines, null);
+  assert.deepEqual(Object.keys(conflict.sides).sort(), ["claude", "codex"]);
+  assert.deepEqual(conflict.sides["claude"], []);
+});
+
+test("merge: delete + insertion at the same anchor both survive, either juror order (F5)", () => {
+  const base = map([["f.txt", "l1\nl2\nl3\nl4\nl5\nl6\nl7\n"]]);
+  const del = map([["f.txt", "l1\nl2\nl3\nl4\nl6\nl7\n"]]);
+  const ins = map([["f.txt", "l1\nl2\nl3\nl4\nINSERTED\nl5\nl6\nl7\n"]]);
+  for (const candidates of [
+    [
+      { juror: "aaa", files: del },
+      { juror: "bbb", files: ins },
+    ],
+    [
+      { juror: "aaa", files: ins },
+      { juror: "zzz", files: del },
+    ],
+  ]) {
+    const result = mergeCandidates(base, candidates);
+    const merged = result.merged.get("f.txt") ?? "";
+    assert.ok(merged.includes("INSERTED"), `insertion survived: ${JSON.stringify(merged)}`);
+    assert.equal(
+      merged.split("\n").includes("l5"),
+      false,
+      `deletion survived: ${JSON.stringify(merged)}`,
+    );
+    assert.equal(result.dropped.length, 0);
+  }
+});
+
+test("merge: whole-file test-pick choice resolves an added-file conflict (F6)", () => {
+  const base = map([]);
+  const result = mergeCandidates(
+    base,
+    [
+      { juror: "claude", files: map([["new.txt", "side A\n"]]) },
+      { juror: "codex", files: map([["new.txt", "side B\n"]]) },
+    ],
+    { choices: new Map([["new.txt:whole", "codex"]]) },
+  );
+  assert.equal(result.merged.get("new.txt"), "side B\n");
+  assert.equal(result.conflicts.length, 1);
+  const conflict = result.conflicts[0];
+  assert.ok(conflict !== undefined);
+  assert.equal(conflict.rule, "tests");
+  assert.equal(conflict.winner, "codex");
+  assert.equal(result.dropped.length, 1);
+  const dropped = result.dropped[0];
+  assert.ok(dropped !== undefined);
+  assert.equal(dropped.juror, "claude");
+  assert.equal(dropped.rule, "tests");
+});
+
+test("merge: whole-file test-pick choice resolves delete vs keep (F6)", () => {
+  const base = map([["victim.txt", "keep me\n"]]);
+  const result = mergeCandidates(
+    base,
+    [
+      { juror: "claude", files: map([]) },
+      { juror: "codex", files: map([["victim.txt", "keep me\n"]]) },
+    ],
+    { choices: new Map([["victim.txt:whole", "claude"]]) },
+  );
+  assert.equal(result.merged.has("victim.txt"), false);
+  const conflict = result.conflicts[0];
+  assert.ok(conflict !== undefined);
+  assert.equal(conflict.rule, "tests");
+  assert.equal(conflict.winner, "claude");
+});
+
+test("diff: edit distance past the trace budget throws DiffTooLargeError (F8)", () => {
+  const a = Array.from({ length: 4000 }, (_, i) => `base-line-${i}`);
+  const b = Array.from({ length: 4000 }, (_, i) => `cand-line-${i}`);
+  assert.throws(() => diffLines(a, b), DiffTooLargeError);
+});
+
+test("merge: two 20k-line files with no common lines become a whole-file conflict, no OOM (F8)", () => {
+  const a = Array.from({ length: 20_000 }, (_, i) => `base-line-${i}`).join("\n");
+  const b = Array.from({ length: 20_000 }, (_, i) => `cand-line-${i}`).join("\n");
+  const c = Array.from({ length: 20_000 }, (_, i) => `other-line-${i}`).join("\n");
+  const result = mergeCandidates(map([["f.txt", a]]), [
+    { juror: "claude", files: map([["f.txt", b]]) },
+    { juror: "codex", files: map([["f.txt", c]]) },
+  ]);
+  assert.equal(result.conflicts.length, 1);
+  const conflict = result.conflicts[0];
+  assert.ok(conflict !== undefined);
+  assert.equal(conflict.rule, "unresolved");
+  // Sides are truncated in the record (S-8).
+  const sides = conflict.sides["claude"] ?? [];
+  assert.ok(sides.length <= 101);
+  assert.match(sides[sides.length - 1] ?? "", /truncated/);
+  assert.equal(result.merged.get("f.txt"), a);
+});
+
+test("renderUnifiedDiff: oversize input renders a placeholder, never throws (F3)", () => {
+  const big = Array.from({ length: 20_001 }, (_, i) => `line ${i}`);
+  const diff = renderUnifiedDiff("big.txt", [], big);
+  assert.match(diff, /oversize/);
+  assert.equal(diff.includes("line 20000"), false);
 });

@@ -259,3 +259,56 @@ test("arbitrator: juror order does not change the merge (D-1)", async () => {
   assert.equal(r1.verdict.merge.diff, r2.verdict.merge.diff);
   assert.equal(r1.verdict.tier, r2.verdict.tier);
 });
+
+test("arbitrator: test-pick resolves a whole-file conflict (F6, P5)", async () => {
+  const repo = await fixtureRepo({ "package.json": JSON.stringify({ scripts: { test: "true" } }) });
+  const { outcomes: outs, baseFiles } = await outcomes(repo, [
+    new FakeAdapter("fake-a", { files: { "new.txt": "side A\n" } }),
+    new FakeAdapter("fake-b", { files: { "new.txt": "side B\n" } }),
+  ]);
+  const { verdict, mergedFiles } = await arbitrate({
+    repo,
+    task: "do it",
+    redactTask: false,
+    baseFiles,
+    outcomes: outs,
+    testCommand: "true",
+    testTimeoutMs: 5000,
+    keypair,
+    version: "0.1.0",
+  });
+  // Both sides pass `true`, so the first side (fake-a) wins by test-pick.
+  assert.equal(verdict.tier, "MAJORITY");
+  assert.equal(verdict.merge.conflicts.length, 1);
+  const conflict = verdict.merge.conflicts[0];
+  assert.ok(conflict !== undefined);
+  assert.equal(conflict.rule, "tests");
+  assert.equal(conflict.winner, "fake-a");
+  assert.equal(mergedFiles.get("new.txt"), "side A\n");
+  assert.equal(verifyVerdict(verdict).ok, true);
+});
+
+test("arbitrator: delete vs keep is recorded as a conflict and the file stays (F4)", async () => {
+  const repo = await fixtureRepo({ "victim.txt": "keep me\n" });
+  const { outcomes: outs, baseFiles } = await outcomes(repo, [
+    new FakeAdapter("fake-del", { files: { "victim.txt": null } }),
+    new FakeAdapter("fake-keep", { files: {} }),
+  ]);
+  const { verdict, mergedFiles } = await arbitrate({
+    repo,
+    task: "do it",
+    redactTask: false,
+    baseFiles,
+    outcomes: outs,
+    testCommand: null,
+    testTimeoutMs: 5000,
+    keypair,
+    version: "0.1.0",
+  });
+  assert.equal(verdict.tier, "DIVERGED");
+  assert.equal(mergedFiles.get("victim.txt"), "keep me\n");
+  const conflict = verdict.merge.conflicts.find((c) => c.file === "victim.txt");
+  assert.ok(conflict !== undefined);
+  assert.equal(conflict.rule, "unresolved");
+  assert.equal(verifyVerdict(verdict).ok, true);
+});

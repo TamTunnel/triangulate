@@ -18,6 +18,10 @@
 import Parser from "tree-sitter";
 import tsGrammars from "tree-sitter-typescript";
 import JavaScript from "tree-sitter-javascript";
+// Circular import with differ.ts (differ.ts imports tryAstMerge from
+// here): safe in practice — both modules use each other only at call
+// time, never at module-eval time — but fragile; do not add
+// module-eval-time cross-uses.
 import { diffLines, opsToHunks } from "./differ.js";
 
 // The grammar packages are CJS; the default import is the exports object.

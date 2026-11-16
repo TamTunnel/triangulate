@@ -66,6 +66,8 @@ check("diff prints the merged diff", diff.status === 0 && diff.stdout.includes("
 const tampered = { ...verdict, tier: "UNANIMOUS" };
 await writeFile(out, JSON.stringify(tampered), "utf8");
 check("tampered verdict fails verify (exit 2)", run(["verify", out]).status === 2);
+check("tampered verdict refused by show (exit 2)", run(["show", out]).status === 2);
+check("tampered verdict refused by diff (exit 2)", run(["diff", out]).status === 2);
 
 // 4. Real-adapter dry run: shows the exact commands, runs nothing.
 const dry = run([

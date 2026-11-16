@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FakeAdapter } from "../src/adapters/fake.js";
@@ -130,14 +130,72 @@ test("grok: applies a valid file map, rejects traversal and bad JSON", async () 
   }
 });
 
+test("grok: file map cannot overwrite .git or write through a symlink (F2, S-2/S-7)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tri-grok2-"));
+  await writeFile(join(dir, "a.txt"), "hello\n", "utf8");
+  const originalFetch = globalThis.fetch;
+  try {
+    const fakeResponse = (content: string) => ({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve({
+          model: "grok-4",
+          choices: [{ message: { content } }],
+        }),
+    });
+    // `.git` pointer overwrite (the P7 attack): rejected, file untouched.
+    await writeFile(join(dir, ".git"), "gitdir: /tmp/real-git-dir\n", "utf8");
+    globalThis.fetch = () =>
+      Promise.resolve(
+        fakeResponse(JSON.stringify({ ".git": "gitdir: /tmp/evil-git-dir", "a.txt": "hi\n" })) as never,
+      );
+    const gitAttack = await new GrokAdapter().run(
+      input({ worktree: dir, env: { XAI_API_KEY: "xai-test-key" } }),
+    );
+    assert.equal(gitAttack.status, "failed");
+    assert.equal(await readFile(join(dir, ".git"), "utf8"), "gitdir: /tmp/real-git-dir\n");
+    assert.equal(await readFile(join(dir, "a.txt"), "utf8"), "hello\n");
+
+    // `.git/config` nested path: rejected too.
+    globalThis.fetch = () =>
+      Promise.resolve(
+        fakeResponse(JSON.stringify({ ".git/config": "[core]\n" })) as never,
+      );
+    const nested = await new GrokAdapter().run(
+      input({ worktree: dir, env: { XAI_API_KEY: "xai-test-key" } }),
+    );
+    assert.equal(nested.status, "failed");
+
+    // Write through a symlinked directory: rejected, outside file untouched.
+    const outside = await mkdtemp(join(tmpdir(), "tri-outside-"));
+    const outsideFile = join(outside, "target.txt");
+    await writeFile(outsideFile, "untouched", "utf8");
+    await symlink(outside, join(dir, "link"));
+    globalThis.fetch = () =>
+      Promise.resolve(
+        fakeResponse(JSON.stringify({ "link/evil.txt": "pwned" })) as never,
+      );
+    const linkAttack = await new GrokAdapter().run(
+      input({ worktree: dir, env: { XAI_API_KEY: "xai-test-key" } }),
+    );
+    assert.equal(linkAttack.status, "failed");
+    assert.equal(await readFile(outsideFile, "utf8"), "untouched");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("redaction: key-shaped values never survive (S-1)", () => {
   const dirty =
-    "key sk-ant-api03-abcdef1234567890 and xai-abcdef1234 and AKIAIOSFODNN7EXAMPLE and ghp_abcdefghij1234567890";
+    "key sk-ant-api03-abcdef1234567890 and xai-abcdef1234 and AKIAIOSFODNN7EXAMPLE and ghp_abcdefghij1234567890 and AIzaSyA-1234567890abcdefghijklmnopqrstu and ya29.a0AfH6SMBx-abcdef1234567890";
   const clean = redactSecrets(dirty);
   assert.equal(clean.includes("sk-ant-"), false);
   assert.equal(clean.includes("xai-"), false);
   assert.equal(clean.includes("AKIA"), false);
   assert.equal(clean.includes("ghp_"), false);
+  assert.equal(clean.includes("AIza"), false);
+  assert.equal(clean.includes("ya29."), false);
   assert.equal(clean.includes("<redacted-key>"), true);
 });
 

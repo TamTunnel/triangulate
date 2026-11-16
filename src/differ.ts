@@ -26,10 +26,50 @@
 import { canonicalHash } from "./core/jcs.js";
 import type { ConflictRecord, DroppedHunkRecord } from "./core/verdict.js";
 export type { ConflictRecord, DroppedHunkRecord } from "./core/verdict.js";
+// Circular import with ast.ts (ast.ts imports diffLines/opsToHunks
+// from here): safe in practice — both modules use each other only at
+// call time, never at module-eval time — but fragile; do not add
+// module-eval-time cross-uses.
 import { tryAstMerge } from "./ast.js";
 
 export const MAX_FILE_BYTES = 1_048_576;
 export const MAX_FILE_LINES = 20_000;
+
+/**
+ * The Myers trace stores one V array per edit step D; on inputs that
+ * differ almost everywhere D ≈ n+m and the trace is O(D·N) memory
+ * (measured +316 MB at 4,000 fully-different lines, ~15 GB
+ * extrapolated at the 20k-line cap). Bound the trace to this many
+ * bytes: past it, diffLines throws DiffTooLargeError and callers treat
+ * the file as a whole-file replacement instead (S-8).
+ */
+export const MAX_TRACE_BYTES = 64 * 1024 * 1024;
+
+export class DiffTooLargeError extends Error {
+  constructor() {
+    super("diff edit distance exceeds the trace budget");
+  }
+}
+
+/** Whole-file conflict sides are truncated: a 20,000-line file must not
+ * embed its full content in the verdict (S-8). Test-pick applies sides
+ * from the candidate snapshots, never from the recorded sides, so
+ * truncation loses no arbitration fidelity. */
+export const MAX_CONFLICT_SIDE_LINES = 100;
+
+function truncateSide(lines: string[]): string[] {
+  if (lines.length <= MAX_CONFLICT_SIDE_LINES) return lines;
+  return [
+    ...lines.slice(0, MAX_CONFLICT_SIDE_LINES),
+    `<triangulate: truncated ${lines.length - MAX_CONFLICT_SIDE_LINES} more lines>`,
+  ];
+}
+
+function truncatedSides(sides: Record<string, string[]>): Record<string, string[]> {
+  return Object.fromEntries(
+    Object.entries(sides).map(([juror, lines]) => [juror, truncateSide(lines)]),
+  );
+}
 
 export type FileMap = Map<string, string>;
 
@@ -89,12 +129,15 @@ export function diffLines(a: string[], b: string[]): DiffOp[] {
   const m = b.length;
   const max = n + m;
   if (max === 0) return [];
+  // Bound the trace: each V array is 4*(2*max+1) bytes, one per D.
+  const dMax = Math.max(1, Math.floor(MAX_TRACE_BYTES / ((2 * max + 1) * 4)));
   // Trace of V arrays per D, for backtracking.
   const trace: Int32Array[] = [];
   const v = new Int32Array(2 * max + 1);
   const offset = max;
   let foundD = -1;
   outer: for (let d = 0; d <= max; d += 1) {
+    if (d > dMax) throw new DiffTooLargeError();
     const vd = new Int32Array(2 * max + 1);
     vd.set(v);
     for (let k = -d; k <= d; k += 2) {
@@ -206,9 +249,23 @@ function isSubsequence(needle: string[], haystack: string[]): boolean {
   return false;
 }
 
-/** Render a unified diff (3 lines of context) from base to new lines. */
+/** Render a unified diff (3 lines of context) from base to new lines.
+ * Never throws on oversize input: a file over the caps, or a pair
+ * whose edit distance exceeds the trace budget, renders as a short
+ * placeholder instead — the render paths (orchestrator, arbitrator)
+ * must never crash a run over one bad file (F3). */
 export function renderUnifiedDiff(file: string, baseLines: string[], newLines: string[]): string {
-  const ops = diffLines(baseLines, newLines);
+  const oversizeNote = (reason: string): string =>
+    `--- a/${file}\n+++ b/${file}\n@@ oversize: ${reason}; diff omitted @@\n`;
+  if (baseLines.length > MAX_FILE_LINES || newLines.length > MAX_FILE_LINES) {
+    return oversizeNote("file exceeds the line cap");
+  }
+  let ops: DiffOp[];
+  try {
+    ops = diffLines(baseLines, newLines);
+  } catch {
+    return oversizeNote("files differ too much to diff line by line");
+  }
   const context = 3;
   // Group change ops; equal runs of <= 2*context between changes stay in
   // one hunk, longer runs split hunks.
@@ -379,20 +436,35 @@ function applyDisjoint(
     }
   }
   // Apply: walk the region's base lines, emitting each side's replacement
-  // for the hunks it owns, in base order.
+  // for the hunks it owns, in base order. Several hunks may share one
+  // anchor (a pure insertion and the deletion/replacement that starts
+  // there): they are a list, not one entry — keying by baseStart alone
+  // silently dropped whichever hunk was overwritten (F5).
   const out: string[] = [];
-  const byStart = new Map<number, { side: RegionSide; hunk: Hunk }>();
+  const byStart = new Map<number, { side: RegionSide; hunk: Hunk }[]>();
   for (const side of sides) {
     for (const hunk of side.hunks) {
-      byStart.set(hunk.baseStart, { side, hunk });
+      const list = byStart.get(hunk.baseStart) ?? [];
+      list.push({ side, hunk });
+      byStart.set(hunk.baseStart, list);
     }
   }
   let i = region.start;
   while (i < region.end) {
-    const hit = byStart.get(i);
-    if (hit !== undefined) {
-      out.push(...hit.hunk.newLines);
-      i = Math.max(hit.hunk.baseEnd, i + 1);
+    const hits = byStart.get(i);
+    if (hits !== undefined) {
+      // Pure insertions first (they consume no base lines), then the
+      // replacement/deletion that shares the anchor — both effects
+      // survive.
+      const ordered = [...hits].sort(
+        (a, b) => a.hunk.baseEnd - a.hunk.baseStart - (b.hunk.baseEnd - b.hunk.baseStart),
+      );
+      let next = i + 1;
+      for (const hit of ordered) {
+        out.push(...hit.hunk.newLines);
+        next = Math.max(next, hit.hunk.baseEnd);
+      }
+      i = next;
     } else {
       // Insertion anchors at this position (pure insertions, baseStart == baseEnd).
       for (const side of sides) {
@@ -503,6 +575,44 @@ function isCodeFile(path: string): boolean {
   return /\.(ts|tsx|js|jsx|mts|cts|mjs|cjs)$/.test(path);
 }
 
+/**
+ * A test-pick choice for a whole-file conflict (`${file}:whole`):
+ * records the win (rule "tests") and the losers' drops, and returns
+ * the winning juror id — or null when no choice applies. The caller
+ * applies the winner's side (content, or deletion when the winner is
+ * a deleter). Without this, whole-file conflicts were test-picked for
+ * a choice the differ could never apply (F6).
+ */
+function applyWholeFileChoice(
+  path: string,
+  sides: Record<string, string[]>,
+  choices: Map<string, string>,
+  conflicts: ConflictRecord[],
+  dropped: DroppedHunkRecord[],
+): string | null {
+  const winner = choices.get(`${path}:whole`);
+  if (winner === undefined) return null;
+  if (sides[winner] === undefined) return null;
+  for (const juror of Object.keys(sides).sort()) {
+    if (juror !== winner) {
+      dropped.push({
+        file: path,
+        juror,
+        rule: "tests",
+        detail: `whole-file conflict resolved for ${winner} by test run`,
+      });
+    }
+  }
+  conflicts.push({
+    file: path,
+    baseLines: null,
+    sides: truncatedSides(sides),
+    rule: "tests",
+    winner,
+  });
+  return winner;
+}
+
 export function mergeCandidates(
   base: FileMap,
   candidates: CandidateSnapshot[],
@@ -570,7 +680,15 @@ export function mergeCandidates(
         const content = lines[i];
         if (holder !== undefined && content !== undefined) sides[holder.juror] = content;
       }
-      conflicts.push({ file: path, baseLines: null, sides, rule: "unresolved" });
+      // Test-pick choice (F6): the winner's content becomes the file.
+      const wholeWinner = applyWholeFileChoice(path, sides, choices, conflicts, dropped);
+      if (wholeWinner !== null) {
+        const winnerIndex = holders.findIndex((h) => h.juror === wholeWinner);
+        const winnerContent = winnerIndex >= 0 ? contents[winnerIndex] : undefined;
+        if (winnerContent !== undefined) merged.set(path, winnerContent);
+        continue;
+      }
+      conflicts.push({ file: path, baseLines: null, sides: truncatedSides(sides), rule: "unresolved" });
       const out: string[] = ["<<<<<<< triangulate: conflict (added file)"];
       holders.forEach((h, i) => {
         if (i > 0) out.push("=======");
@@ -602,7 +720,31 @@ export function mergeCandidates(
       // Delete vs modify conflict.
       const modifiers = holders.filter((h) => h.files.get(path) !== baseContent);
       if (modifiers.length === 0) {
-        // Everyone who kept it left it unchanged; deleters agree.
+        // Delete vs keep: some jurors deleted the file, the rest left
+        // it untouched. The file stays — deletion needs agreement —
+        // and the disagreement is recorded as an unresolved whole-file
+        // conflict (F4), never silently dropped (D-6). Test-pick may
+        // resolve it (F6): a deleter win deletes the file, a keeper
+        // win keeps it.
+        const keepers = holders.filter((h) => h.files.get(path) === baseContent);
+        const sides: Record<string, string[]> = {};
+        for (const d of deleters) sides[d.juror] = [];
+        for (const k of keepers) sides[k.juror] = splitLines(baseContent);
+        const winner = applyWholeFileChoice(path, sides, choices, conflicts, dropped);
+        if (winner !== null) {
+          if (!deleters.some((d) => d.juror === winner)) {
+            merged.set(path, baseContent);
+          }
+          // A deleter win: the file is not set in the merge (deleted).
+        } else {
+          conflicts.push({
+            file: path,
+            baseLines: null,
+            sides: truncatedSides(sides),
+            rule: "unresolved",
+          });
+          merged.set(path, baseContent);
+        }
         continue;
       }
       const sides: Record<string, string[]> = {};
@@ -611,10 +753,20 @@ export function mergeCandidates(
         const content = m.files.get(path);
         if (content !== undefined) sides[m.juror] = splitLines(content);
       }
+      const winner = applyWholeFileChoice(path, sides, choices, conflicts, dropped);
+      if (winner !== null) {
+        if (deleters.some((d) => d.juror === winner)) {
+          // Winner deleted the file: do not set it in the merge.
+        } else {
+          const content = modifiers.find((m) => m.juror === winner)?.files.get(path);
+          if (content !== undefined) merged.set(path, content);
+        }
+        continue;
+      }
       conflicts.push({
         file: path,
         baseLines: null,
-        sides,
+        sides: truncatedSides(sides),
         rule: "unresolved",
       });
       merged.set(path, baseContent);
@@ -671,12 +823,21 @@ export function mergeCandidates(
     }
     if (oversize) {
       // Whole-file replacement conflict: too big to diff line by line.
+      // Sides are truncated in the record (S-8); test-pick applies
+      // the winner's full content from the candidate snapshot (F6).
+      const sides: Record<string, string[]> = Object.fromEntries(
+        modifiers.map((m) => [m.juror, splitLines(m.files.get(path) as string)]),
+      );
+      const winner = applyWholeFileChoice(path, sides, choices, conflicts, dropped);
+      if (winner !== null) {
+        const content = modifiers.find((m) => m.juror === winner)?.files.get(path);
+        if (content !== undefined) merged.set(path, content);
+        continue;
+      }
       conflicts.push({
         file: path,
         baseLines: null,
-        sides: Object.fromEntries(
-          modifiers.map((m) => [m.juror, splitLines(m.files.get(path) as string)]),
-        ),
+        sides: truncatedSides(sides),
         rule: "unresolved",
       });
       merged.set(path, baseContent);

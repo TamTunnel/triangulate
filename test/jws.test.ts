@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import test from "node:test";
 import assert from "node:assert/strict";
+import { sign } from "node:crypto";
+import { canonicalize } from "../src/core/jcs.js";
 import {
+  base64urlEncode,
   fingerprint,
   generateKeypair,
   keypairFromPem,
@@ -59,4 +62,20 @@ test("JWS: malformed inputs fail closed", () => {
   assert.equal(verifyJws("not-a-jws", kp.publicKey).ok, false);
   assert.equal(verifyJws("a.b", kp.publicKey).ok, false);
   assert.equal(verifyJws("a.b.c.d", kp.publicKey).ok, false);
+});
+
+test("JWS: a header without the verdict typ fails verification (N5)", () => {
+  const kp = generateKeypair();
+  // Mint a JWS by hand with the right alg/kid/signature but no typ:
+  // it must not verify as a verdict JWS.
+  const header = { alg: "Ed25519", kid: kp.kid };
+  const payload = { a: 1 };
+  const headerB64 = base64urlEncode(canonicalize(header));
+  const payloadB64 = base64urlEncode(canonicalize(payload));
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const sig = sign(null, Buffer.from(signingInput, "utf8"), kp.privateKeyPem);
+  const jws = `${signingInput}.${base64urlEncode(sig)}`;
+  const result = verifyJws(jws, kp.publicKey);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "malformed-header");
 });

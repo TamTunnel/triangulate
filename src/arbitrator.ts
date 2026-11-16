@@ -4,9 +4,11 @@
 // never an LLM, never a vote, never a model's synthesis (assessment §5).
 // Test-pick: when a conflict survives the rules, each side is applied to
 // the BASE file in isolation and the repo's tests are run; a side that
-// passes twice wins, and the win is recorded with rule "tests". A test
-// result never changes the tier (D-5): the tier describes the merge,
-// the test record describes the check.
+// passes twice wins, and the win is recorded with rule "tests" —
+// resolving a conflict this way is what moves a run from DIVERGED to
+// MAJORITY. The final test check on the merged result never changes
+// the tier (D-5): it is recorded, and a failure there is flagged,
+// not tier-changing.
 
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -133,20 +135,27 @@ async function runTestsInWorktree(
   }
 }
 
-/** Apply one conflict side to the base file, in isolation (no markers). */
+/** Apply one conflict side to the base file, in isolation (no markers).
+ * For whole-file conflicts the side's content comes from the juror's
+ * candidate snapshot, never from the recorded sides — whole-file sides
+ * are truncated in the verdict (S-8), so applying them would test a
+ * truncated file. */
 function applySideToBase(
   baseFiles: FileMap,
   conflict: DifferConflict,
   juror: string,
+  candidates: Map<string, FileMap>,
 ): FileMap {
   const out: FileMap = new Map(baseFiles);
-  const side = conflict.sides[juror] ?? [];
   if (conflict.baseLines === null) {
-    // Whole-file conflict: the side's lines are the whole file.
-    if (side.length === 0) out.delete(conflict.file);
-    else out.set(conflict.file, side.join("\n"));
+    // Whole-file conflict: the side is the juror's actual candidate
+    // file (absent = the juror deleted it).
+    const files = candidates.get(juror);
+    if (files === undefined || !files.has(conflict.file)) out.delete(conflict.file);
+    else out.set(conflict.file, files.get(conflict.file) as string);
     return out;
   }
+  const side = conflict.sides[juror] ?? [];
   const base = baseFiles.get(conflict.file);
   if (base === undefined) return out;
   const lines = base.split("\n");
@@ -204,6 +213,7 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
     diff: o.diff,
     hash: o.diffHash,
     ...(o.binaryChanges.length > 0 ? { binaryChanges: o.binaryChanges } : {}),
+    ...(o.skippedChanges.length > 0 ? { skippedChanges: o.skippedChanges } : {}),
   }));
 
   // No juror produced a candidate: the run failed outright.
@@ -250,6 +260,7 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
   // a test command exists. Each side is tested in isolation on the base.
   if (merge.conflicts.length > 0 && merge.conflicts.length <= MAX_TEST_PICK_CONFLICTS && opts.testCommand !== null) {
     const choices = new Map<string, string>();
+    const candidateFiles = new Map(okOutcomes.map((o) => [o.adapter.id, o.files]));
     for (const conflict of merge.conflicts) {
       // The differ keys choices by 0-based base coordinates; the conflict
       // record stores a 1-based inclusive range, so the start shifts by
@@ -261,7 +272,7 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
       const sideIds = Object.keys(conflict.sides).sort();
       let winner: string | null = null;
       for (const sideId of sideIds) {
-        const variant = applySideToBase(opts.baseFiles, conflict, sideId);
+        const variant = applySideToBase(opts.baseFiles, conflict, sideId, candidateFiles);
         const first = await runTestsInWorktree(
           opts.repo,
           variant,
@@ -356,6 +367,14 @@ export async function arbitrate(opts: ArbitrateOptions): Promise<ArbitrateResult
     });
   }
   for (const outcome of opts.outcomes) {
+    for (const skipped of outcome.skippedChanges) {
+      dissent.push({
+        kind: "skipped-file",
+        juror: outcome.adapter.id,
+        file: skipped,
+        note: "symlink in the worktree was not followed during capture (S-4)",
+      });
+    }
     if (outcome.result.status !== "ok") {
       dissent.push({
         kind: `juror-${outcome.result.status}`,

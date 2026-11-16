@@ -29,6 +29,11 @@ export async function runCommand(
         env: opts.env,
         timeout: opts.timeoutMs,
         killSignal: "SIGKILL",
+        // Detached: the child leads its own process group, so a
+        // timeout can kill the whole tree (N2) — a CLI that spawns
+        // grandchildren must not leave orphans spending after its
+        // juror is recorded as timed out.
+        detached: true,
       });
     } catch {
       resolve({
@@ -46,7 +51,12 @@ export async function runCommand(
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      // Kill the whole process group, not just the direct child.
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
     }, opts.timeoutMs);
     timer.unref();
     child.stdout?.on("data", (chunk: Buffer) => {

@@ -6,6 +6,7 @@
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { canonicalHash } from "./jcs.js";
+import { withFileLock } from "./lock.js";
 import type { Verdict, VerdictTier } from "./verdict.js";
 
 export interface LogEntry {
@@ -55,33 +56,37 @@ export async function readVerdict(path: string): Promise<Verdict> {
   return JSON.parse(text) as Verdict;
 }
 
-/** Append one hash-chained entry to the JSONL log; returns the entry. */
+/** Append one hash-chained entry to the JSONL log; returns the entry.
+ * The read-tail + append is serialized through a cross-process lock
+ * (A-3): without it, concurrent runs all read the same tail and all
+ * write the same seq, corrupting the chain (F7). */
 export async function appendLog(
   verdict: Verdict,
   logPath: string,
 ): Promise<LogEntry> {
-  let prev = "";
-  let seq = 0;
-  try {
-    const text = await readFile(logPath, "utf8");
-    const lines = text.split("\n").filter((line) => line.trim().length > 0);
-    if (lines.length > 0) {
-      const lastLine = lines[lines.length - 1];
-      if (lastLine !== undefined) {
-        const last = JSON.parse(lastLine) as LogEntry;
-        prev = last.hash;
-        seq = last.seq + 1;
+  return withFileLock(`${logPath}.lock`, async () => {
+    let prev = "";
+    let seq = 0;
+    try {
+      const text = await readFile(logPath, "utf8");
+      const lines = text.split("\n").filter((line) => line.trim().length > 0);
+      if (lines.length > 0) {
+        const lastLine = lines[lines.length - 1];
+        if (lastLine !== undefined) {
+          const last = JSON.parse(lastLine) as LogEntry;
+          prev = last.hash;
+          seq = last.seq + 1;
+        }
       }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== undefined && code !== "ENOENT") throw error;
     }
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== undefined && code !== "ENOENT") throw error;
-  }
-  const base = { seq, id: verdict.id, tier: verdict.tier, created_at: verdict.created_at, prev };
-  const entry: LogEntry = { ...base, hash: logEntryHash(base) };
-  await mkdir(join(logPath, ".."), { recursive: true }).catch(() => undefined);
-  await appendFile(logPath, `${JSON.stringify(entry)}\n`, "utf8");
-  return entry;
+    const base = { seq, id: verdict.id, tier: verdict.tier, created_at: verdict.created_at, prev };
+    const entry: LogEntry = { ...base, hash: logEntryHash(base) };
+    await appendFile(logPath, `${JSON.stringify(entry)}\n`, "utf8");
+    return entry;
+  });
 }
 
 /** Read the log; returns [] when it does not exist yet. */

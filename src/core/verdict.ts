@@ -47,6 +47,9 @@ export interface CandidateRecord {
   hash: string;
   /** Binary files the juror changed (excluded from the text merge, disclosed here). */
   binaryChanges?: string[];
+  /** Symlinked paths the juror created/changed: never followed during
+   * capture (F1), disclosed here instead of read. */
+  skippedChanges?: string[];
 }
 
 export interface ConflictRecord {
@@ -154,6 +157,9 @@ export interface VerifyVerdictResult {
  * failure found; a verdict that fails here must not be trusted.
  */
 export function verifyVerdict(verdict: Verdict): VerifyVerdictResult {
+  if (verdict === null || typeof verdict !== "object" || Array.isArray(verdict)) {
+    return { ok: false, reason: "malformed-verdict" };
+  }
   if (verdict.format !== VERDICT_FORMAT) return { ok: false, reason: "format-mismatch" };
   const { id, signature, ...payload } = verdict as Verdict & Record<string, unknown>;
   // The payload must contain exactly the signed fields; anything extra

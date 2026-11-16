@@ -125,3 +125,57 @@ test("cli: unknown model and missing task are usage errors (exit 1)", async () =
   assert.equal(await main(["run", "--repo", repo]), 1);
   assert.equal(await main(["frobnicate"]), 1);
 });
+
+test("cli: show and diff refuse a tampered verdict with exit 2 (F12)", async () => {
+  const repo = await fixtureRepo();
+  const out = join(repo, "verdict.json");
+  await main([
+    "run",
+    "--task",
+    "add a note",
+    "--repo",
+    repo,
+    "--models",
+    "claude",
+    "--fake",
+    "--no-test",
+    "--out",
+    out,
+  ]);
+  const verdict = JSON.parse(await readFile(out, "utf8")) as Record<string, unknown>;
+  verdict["tier"] = "UNANIMOUS";
+  await writeFile(out, JSON.stringify(verdict), "utf8");
+  assert.equal(await main(["show", out]), 2);
+  assert.equal(await main(["diff", out]), 2);
+});
+
+test("cli: show and diff handle malformed verdict JSON gracefully (F12)", async () => {
+  const repo = await fixtureRepo();
+  const out = join(repo, "verdict.json");
+  await writeFile(out, "{not json", "utf8");
+  assert.equal(await main(["show", out]), 1);
+  assert.equal(await main(["diff", out]), 1);
+  assert.equal(await main(["verify", out]), 1);
+});
+
+test("cli: --dry-run creates no signing keypair (N3)", async () => {
+  const repo = await fixtureRepo();
+  const home = await mkdtemp(join(tmpdir(), "tri-dry-home-"));
+  process.env["TRIANGULATE_HOME"] = home;
+  try {
+    const code = await main([
+      "run",
+      "--task",
+      "add a note",
+      "--repo",
+      repo,
+      "--models",
+      "claude",
+      "--dry-run",
+    ]);
+    assert.equal(code, 0);
+    await assert.rejects(readFile(join(home, "key.pem"), "utf8"));
+  } finally {
+    process.env["TRIANGULATE_HOME"] = TEST_HOME;
+  }
+});

@@ -52,6 +52,8 @@ const KEY_PATTERNS: RegExp[] = [
   /sk-proj-[A-Za-z0-9_-]{10,}/g,
   /sk-[A-Za-z0-9_-]{20,}/g,
   /xai-[A-Za-z0-9_-]{10,}/g,
+  /AIza[0-9A-Za-z_-]{35}/g,
+  /ya29\.[A-Za-z0-9_-]{10,}/g,
   /ghp_[A-Za-z0-9]{20,}/g,
   /AKIA[A-Z0-9]{16}/g,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/g,

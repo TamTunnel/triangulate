@@ -4,7 +4,8 @@
 // show one, or print its merged diff.
 //
 //   tri run --task <text|@file> [--repo <path>] [--models claude,codex,gemini,grok]
-//           [--timeout <ms>] [--budget <minor>] [--test-cmd <cmd>] [--no-test]
+//           [--timeout <ms>] [--budget <minor>] [--global-budget <minor>]
+//           [--test-cmd <cmd>] [--no-test]
 //           [--redact-task] [--fake] [--dry-run] [--out <path>]
 //   tri verify <verdict.json>
 //   tri show <verdict.json>
@@ -22,6 +23,7 @@ import { arbitrate } from "./arbitrator.js";
 import { getOrCreateKeypair } from "./core/keys.js";
 import { appendLog, readVerdict, writeVerdictFile } from "./core/store.js";
 import { verifyVerdict } from "./core/verdict.js";
+import type { Verdict, VerifyVerdictResult } from "./core/verdict.js";
 import { orchestrate } from "./orchestrator.js";
 import { ClaudeAdapter } from "./adapters/claude.js";
 import { CodexAdapter } from "./adapters/codex.js";
@@ -38,7 +40,8 @@ const HELP = `triangulate ${VERSION} — a multi-model coding jury.
 
 Usage:
   tri run --task <text|@file> [--repo <path>] [--models claude,codex,gemini,grok]
-          [--timeout <ms>] [--budget <minor>] [--test-cmd <cmd>] [--no-test]
+          [--timeout <ms>] [--budget <minor>] [--global-budget <minor>]
+          [--test-cmd <cmd>] [--no-test]
           [--redact-task] [--fake] [--dry-run] [--out <path>]
   tri verify <verdict.json>
   tri show <verdict.json>
@@ -51,6 +54,10 @@ Options for run:
   --models <list>       comma-separated jurors (default: all four)
   --timeout <ms>        per-juror wall-clock cap (default: 600000)
   --budget <minor>      per-juror cost budget in minor units (0 = no cap)
+  --global-budget <minor>  cap on total spend across jurors (0 = no cap);
+                        when set, jurors launch one at a time and launching
+                        stops once the cumulative reported cost exceeds it;
+                        costs the tools do not report cannot be counted
   --test-cmd <cmd>      test command for arbitration (default: auto-detect 'npm test')
   --no-test             skip the test check entirely
   --redact-task         omit the task text from the verdict (hash only)
@@ -73,6 +80,7 @@ interface RunOptions {
   models: string[];
   timeoutMs: number;
   budgetMinor: number;
+  globalBudgetMinor: number;
   testCommand: string | null;
   noTest: boolean;
   redactTask: boolean;
@@ -96,6 +104,7 @@ function parseRunArgs(args: string[]): RunOptions {
     models: [...ALL_MODELS],
     timeoutMs: DEFAULT_TIMEOUT_MS,
     budgetMinor: 0,
+    globalBudgetMinor: 0,
     testCommand: null,
     noTest: false,
     redactTask: false,
@@ -123,6 +132,8 @@ function parseRunArgs(args: string[]): RunOptions {
     else if (arg.startsWith("--timeout=")) opts.timeoutMs = Number(arg.slice("--timeout=".length));
     else if (arg === "--budget") opts.budgetMinor = Number(next());
     else if (arg.startsWith("--budget=")) opts.budgetMinor = Number(arg.slice("--budget=".length));
+    else if (arg === "--global-budget") opts.globalBudgetMinor = Number(next());
+    else if (arg.startsWith("--global-budget=")) opts.globalBudgetMinor = Number(arg.slice("--global-budget=".length));
     else if (arg === "--test-cmd") { opts.testCommand = next(); testCmdGiven = true; }
     else if (arg.startsWith("--test-cmd=")) { opts.testCommand = arg.slice("--test-cmd=".length); testCmdGiven = true; }
     else if (arg === "--no-test") opts.noTest = true;
@@ -142,6 +153,7 @@ function parseRunArgs(args: string[]): RunOptions {
   }
   if (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs <= 0) fail("--timeout must be a positive number of ms");
   if (!Number.isFinite(opts.budgetMinor) || opts.budgetMinor < 0) fail("--budget must be >= 0");
+  if (!Number.isFinite(opts.globalBudgetMinor) || opts.globalBudgetMinor < 0) fail("--global-budget must be >= 0");
   if (opts.noTest && testCmdGiven) fail("--no-test and --test-cmd conflict");
   return opts;
 }
@@ -203,7 +215,6 @@ async function cmdRun(args: string[]): Promise<number> {
     ? null
     : (opts.testCommand ?? (await detectTestCommand(repo)));
   const home = process.env["TRIANGULATE_HOME"] ?? join(homedir(), ".triangulate");
-  const keypair = await getOrCreateKeypair(home);
 
   const adapters = buildAdapters(opts, task);
   if (opts.dryRun) {
@@ -221,6 +232,11 @@ async function cmdRun(args: string[]): Promise<number> {
     return 0;
   }
 
+  // The keypair is created here, not before the dry-run return above:
+  // a read-only inspection command must not have a write side effect
+  // in ~/.triangulate (N3).
+  const keypair = await getOrCreateKeypair(home);
+
   console.log(`triangulate: running ${adapters.length} juror(s) on ${repo}`);
   const { outcomes, baseFiles } = await orchestrate({
     repo,
@@ -228,6 +244,7 @@ async function cmdRun(args: string[]): Promise<number> {
     jurors: adapters,
     timeoutMs: opts.timeoutMs,
     budgetMinor: opts.budgetMinor,
+    globalBudgetMinor: opts.globalBudgetMinor,
     env: process.env,
   });
   for (const outcome of outcomes) {
@@ -266,10 +283,41 @@ async function cmdRun(args: string[]): Promise<number> {
   return verdict.tier === "FAILED" ? 1 : 0;
 }
 
+/** Load a verdict file, or fail with a clean usage error (never a raw
+ * JSON parse stack). */
+async function readVerdictOrFail(file: string): Promise<Verdict> {
+  try {
+    return await readVerdict(resolve(file));
+  } catch {
+    fail(`cannot read verdict: ${file} (missing, or not valid JSON)`);
+  }
+}
+
+/**
+ * Load a verdict and verify it before any content is shown. `show`
+ * and `diff` must not present an unverified verdict as fact (F12):
+ * a tampered verdict is refused with exit 2, exactly like `verify`.
+ * Returns null on verification failure.
+ */
+async function loadVerifiedVerdict(file: string): Promise<Verdict | null> {
+  const verdict = await readVerdictOrFail(file);
+  let result: VerifyVerdictResult;
+  try {
+    result = verifyVerdict(verdict);
+  } catch {
+    result = { ok: false, reason: "malformed-verdict" };
+  }
+  if (!result.ok) {
+    console.log(`INVALID  reason=${result.reason ?? "unknown"} file=${file}`);
+    return null;
+  }
+  return verdict;
+}
+
 async function cmdVerify(args: string[]): Promise<number> {
   const [file] = args;
   if (file === undefined || args.length !== 1) fail("usage: tri verify <verdict.json>");
-  const verdict = await readVerdict(resolve(file));
+  const verdict = await readVerdictOrFail(file);
   const result = verifyVerdict(verdict);
   if (result.ok) {
     console.log(`VALID  tier=${verdict.tier} id=${verdict.id}`);
@@ -282,11 +330,12 @@ async function cmdVerify(args: string[]): Promise<number> {
 async function cmdShow(args: string[]): Promise<number> {
   const [file] = args;
   if (file === undefined || args.length !== 1) fail("usage: tri show <verdict.json>");
-  const verdict = await readVerdict(resolve(file));
+  const verdict = await loadVerifiedVerdict(file);
+  if (verdict === null) return 2;
   console.log(`triangulate verdict ${verdict.id}`);
   console.log(`  format: ${verdict.format}  tier: ${verdict.tier}  created: ${verdict.created_at}`);
   console.log(
-    `  task: ${verdict.task.text ?? `<redacted, hash ${verdict.task.hash.slice(0, 12)}…>`}`,
+    `  task: ${verdict.task.text ?? `<redacted, hash ${verdict.task.hash?.slice(0, 12) ?? "?"}…>`}`,
   );
   console.log(`  repo: ${verdict.repo.path} (base ${verdict.repo.base})`);
   console.log("  jurors:");
@@ -323,7 +372,8 @@ async function cmdShow(args: string[]): Promise<number> {
 async function cmdDiff(args: string[]): Promise<number> {
   const [file] = args;
   if (file === undefined || args.length !== 1) fail("usage: tri diff <verdict.json>");
-  const verdict = await readVerdict(resolve(file));
+  const verdict = await loadVerifiedVerdict(file);
+  if (verdict === null) return 2;
   if (verdict.merge.diff.length === 0) {
     console.log("(no merged diff — the run produced no merge)");
     return 0;

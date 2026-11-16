@@ -40,7 +40,7 @@ tri run --task "Add a note" --repo ./my-project --models claude,codex --dry-run
 
 `--fake` runs scripted fake jurors ($0, no network) so you can see the whole pipeline — worktrees, merge, verdict, log. `--dry-run` prints the exact commands a live run would execute, and runs nothing.
 
-Common flags: `--models claude,codex` (a subset), `--timeout <ms>` per juror (default 600000), `--budget <minor>` per-juror cost budget (0 = no cap), `--test-cmd <cmd>` (default: auto-detect `npm test`), `--no-test` (skip the test check), `--redact-task` (omit the task text from the verdict — the hash stays), `--out <path>` (default `./triangulate-verdict.json`).
+Common flags: `--models claude,codex` (a subset), `--timeout <ms>` per juror (default 600000), `--budget <minor>` per-juror cost budget (0 = no cap), `--global-budget <minor>` cap on total spend across jurors (0 = no cap; jurors then launch one at a time and launching stops once the cumulative reported cost exceeds it — see Cost), `--test-cmd <cmd>` (default: auto-detect `npm test`), `--no-test` (skip the test check), `--redact-task` (omit the task text from the verdict — the hash stays), `--out <path>` (default `./triangulate-verdict.json`).
 
 Your signing key lives in `~/.triangulate/` (or `$TRIANGULATE_HOME`): generated on first run, private key `0600`, never leaves the machine. Every verdict is signed with it, and the public key is embedded in the verdict so anyone can verify offline. There is no registry and no revocation in v1 — if your key is lost or replaced, verdicts signed by the old key can no longer be re-signed, and a new key starts a new identity. Keep a backup of `~/.triangulate/key.pem` somewhere safe.
 
@@ -68,9 +68,10 @@ tri run --task "..." --repo ./my-project
   │   FAILED), runs the repo's own test command on the merged result,
   │   and — only when the rules leave ≤ 3 conflicts — test-picks:
   │   each side is applied to the base in isolation and the tests
-  │   are run; a side that passes twice wins. A test result never
-  │   changes the tier: the tier describes the merge, the test
-  │   record describes the check.
+  │   are run; a side that passes twice wins. The final test check
+  │   on the merged result never changes the tier; test-pick can
+  │   resolve conflicts, which is what moves a run from DIVERGED
+  │   to MAJORITY.
   │
   └─ Verdict (triangulate/1): signed (Ed25519, JCS canonicalization,
       content-addressed id = SHA-256 of the canonical payload),
@@ -93,7 +94,7 @@ A juror that fails, times out, or blows its budget is recorded with its status a
 
 ### Cost
 
-Cost is a feature, never a claim. A juror's cost is reported only when the tool reports it (Claude's `total_cost_usd`, Codex's JSONL usage events when present); otherwise it is `null` — "unknown", never invented. The per-juror budget is enforced at completion for CLI adapters: a CLI cannot observe its own cost mid-run, so a juror whose reported cost exceeds the budget is recorded as `budget` and its candidate is excluded from the merge. The run itself is bounded mid-run by the timeout. The fake adapter enforces its budget mid-run (it is the only adapter that can).
+Cost is a feature, never a claim. A juror's cost is reported only when the tool reports it (Claude's `total_cost_usd`, Codex's JSONL usage events when present); otherwise it is `null` — "unknown", never invented. The per-juror budget is enforced at completion for CLI adapters: a CLI cannot observe its own cost mid-run, so a juror whose reported cost exceeds the budget is recorded as `budget` and its candidate is excluded from the merge. The run itself is bounded mid-run by the timeout. The fake adapter enforces its budget mid-run (it is the only adapter that can). `--global-budget <minor>` caps total spend across jurors: jurors then launch one at a time, and launching stops once the cumulative reported cost exceeds the cap; jurors never launched are recorded as `budget` and the verdict records the partial state. Costs the tools do not report (`null`) cannot be counted toward the cap, so a global budget is a bound on reported spend, not on true spend.
 
 ## Honest limits
 
@@ -126,7 +127,10 @@ There is no mature Grok coding CLI. The Grok juror calls the xAI chat-completion
 The conflict stays unresolved (tier DIVERGED), both sides are recorded in the verdict with conflict markers in the merged diff, and you decide. Nothing is silently resolved by a model — there is no LLM judge in v1, not even a labelled one.
 
 **What if a juror tries to escape its worktree?**
-The candidate is captured only from the juror's own worktree, so an escape write is never merged. The worktree is the isolation boundary; the orchestrator also removes every worktree when the run ends, success or failure.
+The candidate is captured only from the juror's own worktree, so an escape write is never merged — but the worktree is a capture boundary, not a sandbox. The model CLIs run un-sandboxed with your full privileges, so a juror could read or write outside its worktree; it just can't get that into the merge. Symlinks in a worktree are never followed during capture: a symlinked file is recorded as skipped, not read. The worktrees are removed when the run ends, success or failure.
+
+**How do I rotate the verdict log?**
+The log at `~/.triangulate/log.jsonl` is append-only and Triangulate never deletes entries. To rotate it, move `log.jsonl` aside (e.g. `log-2026-11.jsonl`) — the next run starts a fresh chain, and `tri verify` still verifies old verdict files. The log is a local audit trail, not a database: if it grows large, archive it. Rotation is the operator's job in v1.
 
 **Can I use this in CI?**
 Yes: `tri run` exits 0 when a verdict is produced (including DIVERGED), 1 on usage errors or tier FAILED. `tri verify` exits 0 for a valid verdict, 2 for an invalid one. The verdict file is the artifact; the log is local.

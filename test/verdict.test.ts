@@ -159,3 +159,33 @@ test("store: writing a verdict file is not required for the test above", async (
   await writeFile(join(dir, "junk.json"), "{not json", "utf8");
   await assert.rejects(readVerdict(join(dir, "junk.json")));
 });
+
+test("store: concurrent appends do not corrupt the hash chain (F7, A-3)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tri-store-conc-"));
+  const kp = generateKeypair();
+  const logPath = join(dir, "log.jsonl");
+  const mk = (n: number) =>
+    signVerdict(
+      { ...samplePayload(kp), task: { text: `t${n}`, hash: `h${n}` } },
+      kp,
+    );
+  await Promise.all(Array.from({ length: 10 }, (_, i) => appendLog(mk(i), logPath)));
+  const entries = await readLog(logPath);
+  assert.equal(entries.length, 10);
+  assert.deepEqual(
+    entries.map((e) => e.seq),
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  );
+  assert.equal(verifyLog(entries).ok, true);
+});
+
+test("keys: concurrent first runs generate one keypair, not two (N4)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tri-keys-conc-"));
+  const kids = await Promise.all(
+    Array.from({ length: 10 }, () => getOrCreateKeypair(dir).then((kp) => kp.kid)),
+  );
+  assert.equal(new Set(kids).size, 1);
+  const pub = JSON.parse(await readFile(join(dir, "key.pub.json"), "utf8")) as { x: string };
+  const kp = await getOrCreateKeypair(dir);
+  assert.equal(pub.x, kp.publicKey.x);
+});

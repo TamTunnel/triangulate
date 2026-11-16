@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Orchestrator: runs one juror per model in its own git worktree of the
 // target repo, captures each candidate as a full file snapshot, and
-// returns the outcomes for the arbitrator. The worktree is the isolation
-// boundary (S-4): a juror can only affect the merge through files inside
-// its own worktree — the candidate diff is computed from that worktree
-// alone, so an escape write to the base repo or to a sibling worktree is
-// never captured. Adapters must honor timeoutMs themselves (CLI adapters
-// kill their subprocess; Grok aborts its fetch); the orchestrator's race
-// is a backstop that records the timeout even if an adapter misbehaves.
+// returns the outcomes for the arbitrator. The worktree is a capture
+// boundary, not a sandbox (S-4): a juror subprocess runs with the
+// user's full privileges and can read or write outside its worktree,
+// but the candidate diff is computed from that worktree alone, so an
+// escape write is never captured or merged. Symlinks are never
+// followed during capture (F1): a symlinked file is recorded as
+// skipped, never read. Adapters must honor timeoutMs themselves (CLI
+// adapters kill their subprocess; Grok aborts its fetch); the
+// orchestrator's race is a backstop that records the timeout even if
+// an adapter misbehaves.
 
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -31,6 +34,9 @@ export interface JurorOutcome {
   diffHash: string;
   /** Binary files the juror changed (excluded from the text merge, disclosed in the verdict). */
   binaryChanges: string[];
+  /** Symlinked paths the juror created/changed: never followed during
+   * capture (F1), disclosed in the verdict instead of read. */
+  skippedChanges: string[];
 }
 
 export interface OrchestratorResult {
@@ -45,6 +51,11 @@ export interface OrchestratorOptions {
   timeoutMs: number;
   /** Per-juror cost budget in minor units (0 = no cap). */
   budgetMinor: number;
+  /** Global cost budget across all jurors in minor units (0 = no cap).
+   * When set, jurors launch sequentially and launching stops once the
+   * cumulative reported cost exceeds it (A-2); costs the tools do not
+   * report (null) cannot be counted toward the cap. */
+  globalBudgetMinor?: number;
   env: NodeJS.ProcessEnv;
   dryRun?: boolean;
 }
@@ -120,6 +131,7 @@ async function runJuror(
     diff: "",
     diffHash: diffHash(""),
     binaryChanges: [],
+    skippedChanges: [],
   };
   try {
     await git(repo, ["worktree", "add", worktree, "HEAD"]);
@@ -188,6 +200,7 @@ async function runJuror(
         diff: "",
         diffHash: diffHash(""),
         binaryChanges: [],
+        skippedChanges: [],
       };
     }
     if (result.status !== "ok") {
@@ -198,34 +211,58 @@ async function runJuror(
     // changes onto a copy of the base snapshot. --untracked-files=all
     // lists untracked files individually (without it, an untracked
     // directory is reported as one entry and readFile would EISDIR).
-    const status = await git(worktree, ["status", "--porcelain", "-z", "--untracked-files=all"]);
-    const files: FileMap = new Map(baseFiles);
-    const binaryChanges: string[] = [];
-    const entries = status.split("\0").filter((line) => line.length > 0);
-    for (let i = 0; i < entries.length; i += 1) {
-      const entry = entries[i];
-      if (entry === undefined) break;
-      const code = entry.slice(0, 2);
-      const path = entry.slice(3);
-      if (code[0] === "R") {
-        // Rename: the next -z entry is the old path.
-        const oldPath = entries[i + 1];
-        i += 1;
-        if (oldPath !== undefined) files.delete(oldPath);
+    // A capture failure records this juror as failed instead of
+    // rejecting the whole run — one bad juror must never take down
+    // the run (F3).
+    try {
+      const status = await git(worktree, ["status", "--porcelain", "-z", "--untracked-files=all"]);
+      const files: FileMap = new Map(baseFiles);
+      const binaryChanges: string[] = [];
+      const skippedChanges: string[] = [];
+      const entries = status.split("\0").filter((line) => line.length > 0);
+      for (let i = 0; i < entries.length; i += 1) {
+        const entry = entries[i];
+        if (entry === undefined) break;
+        const code = entry.slice(0, 2);
+        const path = entry.slice(3);
+        if (code[0] === "R") {
+          // Rename: the next -z entry is the old path.
+          const oldPath = entries[i + 1];
+          i += 1;
+          if (oldPath !== undefined) files.delete(oldPath);
+        }
+        if (code.includes("D")) {
+          files.delete(path);
+          continue;
+        }
+        // Never follow a symlink out of the worktree (F1): a juror
+        // that links to a file outside the repo must not get its
+        // contents into the candidate, the diff, or the verdict.
+        const target = join(worktree, path);
+        const st = await lstat(target);
+        if (st.isSymbolicLink()) {
+          skippedChanges.push(path);
+          continue;
+        }
+        const buffer = await readFile(target);
+        if (isBinary(buffer)) {
+          binaryChanges.push(path);
+          continue;
+        }
+        files.set(path, buffer.toString("utf8"));
       }
-      if (code.includes("D")) {
-        files.delete(path);
-        continue;
-      }
-      const buffer = await readFile(join(worktree, path));
-      if (isBinary(buffer)) {
-        binaryChanges.push(path);
-        continue;
-      }
-      files.set(path, buffer.toString("utf8"));
+      const diff = renderDiff(baseFiles, files);
+      return { adapter, result, files, diff, diffHash: diffHash(diff), binaryChanges, skippedChanges };
+    } catch (error) {
+      return {
+        ...empty,
+        result: {
+          ...result,
+          status: "failed",
+          reason: `capture failed: ${redactSecrets(error instanceof Error ? error.message : String(error)).slice(0, 200)}`,
+        },
+      };
     }
-    const diff = renderDiff(baseFiles, files);
-    return { adapter, result, files, diff, diffHash: diffHash(diff), binaryChanges };
   } finally {
     try {
       await git(repo, ["worktree", "remove", "--force", worktree]);
@@ -245,6 +282,42 @@ export async function orchestrate(opts: OrchestratorOptions): Promise<Orchestrat
   const baseFiles = await snapshotHead(opts.repo);
   const root = await mkdtemp(join(tmpdir(), "triangulate-"));
   try {
+    const globalBudget = opts.globalBudgetMinor ?? 0;
+    if (globalBudget > 0) {
+      // Global budget (A-2): jurors launch one at a time so the
+      // cumulative reported cost is known before the next launch.
+      // Once it exceeds the cap, the remaining jurors are recorded as
+      // `budget` (never run) and the verdict records the partial
+      // state. Costs the tools do not report (null) cannot be counted.
+      const outcomes: JurorOutcome[] = [];
+      let cumulative = 0;
+      for (const adapter of opts.jurors) {
+        if (cumulative > globalBudget) {
+          outcomes.push({
+            adapter,
+            result: {
+              status: "budget",
+              costMinor: null,
+              durationMs: 0,
+              modelVersion: "unknown",
+              stdout: "",
+              stderr: "",
+              reason: `not run: global budget ${globalBudget} minor exceeded (cumulative reported cost ${cumulative} minor)`,
+            },
+            files: new Map(),
+            diff: "",
+            diffHash: diffHash(""),
+            binaryChanges: [],
+            skippedChanges: [],
+          });
+          continue;
+        }
+        const outcome = await runJuror(adapter, opts, opts.repo, root, baseFiles);
+        outcomes.push(outcome);
+        if (outcome.result.costMinor !== null) cumulative += outcome.result.costMinor;
+      }
+      return { outcomes, baseFiles };
+    }
     const outcomes = await Promise.all(
       opts.jurors.map((adapter) => runJuror(adapter, opts, opts.repo, root, baseFiles)),
     );
