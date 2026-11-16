@@ -2,6 +2,8 @@
 
 A multi-model coding jury. Give the same coding task to Claude, Codex, Gemini, and Grok at once, then diff what they produced, arbitrate deterministically, and merge the best output — with a signed, content-addressed verdict that records every disagreement.
 
+**Demo:** [https://tamtunnel.github.io/triangulate/](https://tamtunnel.github.io/triangulate/) — a real run with a signed verdict, plus a [35-second explainer video](https://tamtunnel.github.io/triangulate/#video). The run used `--fake` scripted jurors (no model credentials in the demo environment).
+
 ## The problem
 
 When you ask one AI model to write code, you get one answer and no way to know if it's the good one. Ask four models and you get four answers — and a new problem: which parts do they agree on, where do they disagree, and which disagreement is right? Today that means eyeballing four diffs by hand, or trusting whichever model you asked last.
